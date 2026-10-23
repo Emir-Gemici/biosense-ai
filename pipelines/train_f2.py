@@ -1,6 +1,15 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  BioSense AI v4.1 — TEKNOFEST RAPORU İÇİN TAM PIPELINE                      ║
+║  BioSense AI v4.2 — CPU %100 KULLANIM (Algoritma-bazlı paralellik)          ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  v4.1 → v4.2 DÜZELTMESİ — CPU verim sorunu çözüldü:                         ║
+║   ✓ FIX O: Algoritmaya göre paralellik stratejisi                           ║
+║      - C++ boosting (XGB/LGB/CB): Optuna 24 paralel, model n_jobs=1         ║
+║      - sklearn tree (RF/ET): Optuna 1 sequential, model n_jobs=-1           ║
+║        Tek model fit ~30s → iç paralelizmle ~2s, dış sequential, GIL temiz  ║
+║      - Diğer sklearn (LR/SVM/kNN/NB/MLP): Optuna 24 paralel, model 1        ║
+║      Net etki: RF/ET fazlarında CPU %100, tahmini hızlanma 3-5x             ║
+║                                                                              ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  v4.0 → v4.1 EKLEMESİ — TEKNOFEST ŞARTNAMESİ TAM UYUMU:                     ║
 ║   ✓ PR-AUC (average_precision_score) eklendi — ZORUNLU metrik               ║
@@ -157,6 +166,23 @@ CIKTI_KORELASYON_CSV = "faz2_korelasyon_matrisi.csv"
 
 PARALEL_ISCI   = 24
 
+# [FIX O] Algoritmaya göre paralellik stratejisi (CPU %10 problemini çözer)
+# Sorun: 24 dış worker × 24 iç thread = 576 thread → GIL bottleneck + DB lock
+# Çözüm: Algoritmaya göre iç ya da dış paralelizm seç, çakıştırma.
+#
+# - C++ boosting (XGB/LGB/CB):  Optuna 24 paralel, model n_jobs=1
+#   → Process'ler bağımsız çalışır, GIL etkisi yok
+# - sklearn tree bagging (RF/ET): Optuna 1 sequential, model n_jobs=-1
+#   → Tree'ler içeride paralel çoğalır (24 ağaç aynı anda)
+#   → Tek model fit ~30s → 24 thread ile ~2s, sonra sıra geliyor
+# - Diğer sklearn (LR/SVM/kNN/NB/MLP): Optuna 24, model n_jobs=1
+#   → Modeller hızlı, dış paralelizm daha verimli
+def algo_paralelizm(algo):
+    """Algoritma için (optuna_n_jobs, model_n_jobs) tuple döndürür."""
+    if algo in ("random_forest", "extra_trees"):
+        return (1, -1)              # Dış sequential, iç tam paralel
+    return (PARALEL_ISCI, 1)        # Dış paralel, iç tek thread
+
 # ── FAZ 1: Geniş tarama ───────────────────────────────────────────
 FAZ1_FOLDS     = 5
 FAZ1_TEKRAR    = 20         # 5×20 = 100 fold (kararlılık için)
@@ -273,7 +299,7 @@ PREPROCESSING_GEREK = {
 }
 
 print("=" * 72)
-print("  BioSense AI v4.1 — TEKNOFEST RAPORU İÇİN TAM PIPELINE")
+print("  BioSense AI v4.2 — CPU %100 (Algoritma-bazlı paralellik)")
 print(f"  Toplam algoritma havuzu: {len(TUM_ALGORITMALAR)}")
 print(f"  FAZ 1: {sum(FAZ1_TRIAL_PER_ALGO.get(a, 30) for a in TUM_ALGORITMALAR)} "
       f"trial × {FAZ1_FOLDS*FAZ1_TEKRAR} fold")
@@ -1025,7 +1051,9 @@ def suggest_params(trial, algo, geniş=True):
             "max_features":     trial.suggest_float("rf_mf", 0.2, 1.0),
             "class_weight":     trial.suggest_categorical("rf_cw",
                                                           ["balanced", "balanced_subsample", None]),
-            "n_jobs": 1, "random_state": RASTGELE_TOHUM,
+            # [FIX O] n_jobs=-1: Optuna outer sequential olduğunda iç paralelizm
+            # tam CPU kullanır. algo_paralelizm() bunu yönetir.
+            "n_jobs": -1, "random_state": RASTGELE_TOHUM,
         }
 
     if algo == "extra_trees":
@@ -1037,7 +1065,7 @@ def suggest_params(trial, algo, geniş=True):
             "max_features":     trial.suggest_float("et_mf", 0.2, 1.0),
             "class_weight":     trial.suggest_categorical("et_cw",
                                                           ["balanced", "balanced_subsample", None]),
-            "n_jobs": 1, "random_state": RASTGELE_TOHUM,
+            "n_jobs": -1, "random_state": RASTGELE_TOHUM,
         }
 
     if algo == "logistic":
@@ -1362,11 +1390,16 @@ for algo in TUM_ALGORITMALAR:
 
     if kalan > 0:
         t0 = time.perf_counter()
+        # [FIX O] Algoritmaya göre paralellik stratejisi
+        outer_njobs, _ = algo_paralelizm(algo)
+        if outer_njobs == 1:
+            print(f"    [FIX O] {algo} için outer SEQUENTIAL, "
+                  f"iç model n_jobs=-1 (24 thread/tree)")
         # ŞEBNUS ÖLÜMSÜZ MODU
         while kalan > 0:
             try:
                 study.optimize(faz1_objective_factory(algo), n_trials=kalan,
-                                n_jobs=PARALEL_ISCI, show_progress_bar=True,
+                                n_jobs=outer_njobs, show_progress_bar=True,
                                 catch=(Exception,))
                 break
             except Exception as e:
@@ -1679,10 +1712,15 @@ for algo in secilen_algoritmalar:
 
     if kalan > 0:
         t0 = time.perf_counter()
+        # [FIX O] Algoritmaya göre paralellik stratejisi
+        outer_njobs, _ = algo_paralelizm(algo)
+        if outer_njobs == 1:
+            print(f"    [FIX O] {algo} için outer SEQUENTIAL, "
+                  f"iç model n_jobs=-1 (24 thread/tree)")
         while kalan > 0:
             try:
                 study.optimize(faz3_objective_factory(algo), n_trials=kalan,
-                                n_jobs=PARALEL_ISCI, show_progress_bar=True,
+                                n_jobs=outer_njobs, show_progress_bar=True,
                                 catch=(Exception,))
                 break
             except Exception as e:
@@ -2260,6 +2298,12 @@ confusion_matrix_gorseli(y_test, test_tahminler,
 # pahalı, en iyi 2 solo için yapalım)
 en_iyi_3_solo = sorted(solo_sonuclari, key=lambda x: x.get("test_f2", 0),
                         reverse=True)[:3]
+
+# v4.1: Initialize — en_iyi_solo_probs hiç atanmazsa (tüm try'lar fail)
+# 'dir()' check'i fragile olduğu için açıkça None ile başlatıyoruz.
+en_iyi_solo_probs = None
+en_iyi_solo_ad    = None
+
 for i, s in enumerate(en_iyi_3_solo):
     ad = s["model"]
     print(f"  → {ad} CM hesaplanıyor (yeniden tahmin)...")
@@ -2288,8 +2332,8 @@ for i, s in enumerate(en_iyi_3_solo):
         guvenli_ad = ad.replace(" ", "_").replace("(", "").replace(")", "")
         confusion_matrix_gorseli(y_test, pred, ad,
                                   f"cm_solo_{i+1}_{guvenli_ad}.png")
-        # ROC/PR için sakla
-        if i == 0:  # en iyi solo
+        # ROC/PR için en iyi solo'yu sakla
+        if i == 0:
             en_iyi_solo_probs = probs
             en_iyi_solo_ad    = ad
         del m
@@ -2304,7 +2348,7 @@ print(f"  → grafikler/solo_vs_ensemble.png")
 # 4. ROC + PR curve karşılaştırma (Ensemble vs en iyi solo)
 try:
     proba_dict = {"Ensemble (4-faz)": final_test_proba}
-    if 'en_iyi_solo_probs' in dir():
+    if en_iyi_solo_probs is not None:
         proba_dict[en_iyi_solo_ad] = en_iyi_solo_probs
     roc_pr_curve_karsilastirma(y_test, proba_dict)
     print(f"  → grafikler/roc_pr_curves.png")
@@ -2394,7 +2438,7 @@ for k in ["n_jobs", "thread_count", "verbosity", "verbose",
 
 sonuc = {
     "_aciklama": {
-        "surum"          : "BioSense AI v4.1 — TEKNOFEST Tam Pipeline (PR-AUC, görseller, eşik tablosu)",
+        "surum"          : "BioSense AI v4.2 — CPU %100 + Tam Pipeline (FIX O)",
         "pipeline"       : [
             "Faz 1: 10 algo geniş tarama + hibrit istatistiksel eleme",
             "Faz 2: Korelasyon + greedy çeşitlilik seçimi → top 3",
@@ -2554,5 +2598,5 @@ print(f"     - cm_ensemble.png + cm_solo_*.png (4 adet)")
 print(f"     - solo_vs_ensemble.png")
 print(f"     - roc_pr_curves.png")
 print("\n" + "=" * 72)
-print("  BioSense AI v4.1 — TAMAMLANDI")
+print("  BioSense AI v4.2 — TAMAMLANDI")
 print("=" * 72)
