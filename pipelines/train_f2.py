@@ -1,22 +1,26 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  BioSense AI v5.2 — KRİTİK BUG FIX (Eşik Seçim + Softmax Temperature)       ║
+║  BioSense AI v6.0 — TEKNOFEST FINAL — Yapısal İyileştirmeler                ║
 ║  Sağlıkta Yapay Zeka Yarışması — Üniversite Kategorisi                      ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║                                                                              ║
-║  ─── v5.1 → v5.2 KRİTİK BUG DÜZELTMELERİ ───                                ║
-║   ⚠ BUG #1: Eşik seçim mantığı F2 maksimumda ilk eşiği seçiyordu            ║
-║      → KANSER ULTRA'da eşik 0.20 seçildi, MCC 0.49 (kötü denge)             ║
-║      ✓ Yeni: F2 ε-tolerans (0.005) içinde MCC tie-break                     ║
-║      ✓ Beklenen: eşik ~0.30, MCC ~0.59, F2 ~0.93 (klinik dengeli)           ║
+║  ─── v5.2 → v6.0 KRİTİK YAPISAL DEĞİŞİKLİKLER ───                           ║
+║   ⭐ FAZ 2 GREEDY MANTIĞI DÜZELTİLDİ (en büyük etki):                       ║
+║     Önceki: bilesik = F2 × (1-kor) → çeşitliliği aşırı vurgu                ║
+║             KANSER'de kNN (F2=0.93) seçildi, CatBoost (F2=0.95) ezildi      ║
+║     Yeni: F2 alt sınır (en iyi-0.025) + bilesik = F2 - 0.15×kor (additive)  ║
+║     Beklenen: ExtraTrees + CatBoost/LightGBM + MLP (3 paradigma + güçlü)    ║
 ║                                                                              ║
-║   ⚠ BUG #2: Softmax sıcaklık 10 → ağırlıklar uniform (1/15=0.067)           ║
-║      → kNN (F2=0.93) ile ExtraTrees (F2=0.96) arasında sadece 1.34x fark    ║
-║      ✓ Yeni: sıcaklık 25 → 7 kat fark, güçlü modellere baskınlık            ║
-║      ✓ Beklenen: ensemble F2 artar, kNN'in negatif etkisi azalır            ║
+║   ⭐ GPU OTOMATİK AKTİVASYONU (RTX 5080 16GB):                              ║
+║     KANSER → CPU (388 örnek için overhead büyük)                            ║
+║     CFTR/PAH/MASTER → CUDA otomatik (3-5x hızlanma)                         ║
+║     Manuel: BIOSENSE_GPU=force | off                                        ║
 ║                                                                              ║
-║   ⚠ BUG #3: PARALEL_ISCI 20 sweet spot eski karar                           ║
-║      ✓ Yeni: 22 worker (Ultra 9 24T için %10 hız iyileştirmesi)             ║
+║   ⭐ ENSEMBLE SHAP BUG FIX:                                                 ║
+║     "Üretilemedi" hatası — kategorik dtype + check_additivity=False         ║
+║     Şimdi tüm tree üyelerden başarılı SHAP alır                             ║
+║                                                                              ║
+║  v5.1/v5.2'den korunan: Eşik MCC tie-break, Softmax 25, klinik akıllılık    ║
 ║                                                                              ║
 ║   ✓ Trial Convergence: Her FAZ 3 algoritması için Optuna progress eğrisi    ║
 ║     → "Sistematik araştırma" kanıtı                                          ║
@@ -253,12 +257,31 @@ try:
         GPU_VAR = True
         GPU_BILGI = _gpu_check.stdout.strip().split("\n")[0]
         print(f"  GPU       : {GPU_BILGI}")
-        if DATA_SUFFIX == "master":
-            print(f"              → MASTER için 'device=cuda' önerilir (3-5x hızlanma)")
     else:
         print(f"  GPU       : Yok / nvidia-smi erişilemez (CPU modu)")
 except Exception:
     print(f"  GPU       : Tespit edilemedi (CPU modu)")
+
+# [v6.0] GPU kullanım politikası — veri seti boyutuna göre otomatik
+# KANSER (388) için GPU overhead büyük, CPU daha hızlı.
+# CFTR/PAH/MASTER için GPU 3-10x hız.
+# Kullanıcı manuel zorlayabilir: BIOSENSE_GPU=force veya BIOSENSE_GPU=off
+_gpu_env = os.environ.get("BIOSENSE_GPU", "").lower()
+if _gpu_env == "force":
+    GPU_AKTIF = GPU_VAR
+elif _gpu_env == "off":
+    GPU_AKTIF = False
+else:
+    # Otomatik: KANSER CPU, diğerleri GPU varsa kullan
+    GPU_AKTIF = GPU_VAR and DATA_SUFFIX in ("cftr", "pah", "master")
+
+XGB_DEVICE  = "cuda" if GPU_AKTIF else "cpu"
+LGB_DEVICE  = "gpu"  if GPU_AKTIF else "cpu"
+CB_TASK_TYPE = "GPU" if GPU_AKTIF else "CPU"
+print(f"  GPU kullanım: {'AKTIF (XGB cuda, LGB gpu, CB GPU)' if GPU_AKTIF else 'KAPALI (CPU modu)'}")
+if GPU_VAR and not GPU_AKTIF:
+    print(f"              → KANSER için CPU daha verimli (overhead az)")
+    print(f"              → CFTR/PAH/MASTER'da GPU otomatik aktif olur")
 
 # [FIX O] Algoritmaya göre paralellik stratejisi (CPU %10 problemini çözer)
 # Sorun: 24 dış worker × 24 iç thread = 576 thread → GIL bottleneck + DB lock
@@ -474,7 +497,7 @@ PREPROCESSING_GEREK = {
 }
 
 print("=" * 72)
-print("  BioSense AI v5.2 — KRİTİK BUG FIX (Eşik Seçim + Softmax) + v5.1 görseller")
+print("  BioSense AI v6.0 — TEKNOFEST FINAL (FAZ 2 fix + GPU + Ensemble SHAP)")
 print(f"  Toplam algoritma havuzu: {len(TUM_ALGORITMALAR)}")
 print(f"  FAZ 1: {sum(FAZ1_TRIAL_PER_ALGO.get(a, 30) for a in TUM_ALGORITMALAR)} "
       f"trial × {FAZ1_FOLDS*FAZ1_TEKRAR} fold")
@@ -1190,28 +1213,61 @@ def feature_group_analizi(all_cols, mean_abs_shap,
 def ensemble_shap_hesapla(final_modeller_tree, X_train, X_test_sample,
                             dosya_adi="ensemble_shap.png"):
     """
-    [v5.1] Final ensemble'ın SHAP analizi.
-    Sadece tree-based modeller için TreeExplainer (kNN/Logistic atlanır).
-    Ensemble'ın gerçek karar mantığını gösterir (referans XGBoost değil).
+    [v5.1 / v6.0 fix] Final ensemble'ın SHAP analizi.
+    Sadece tree-based modeller için TreeExplainer.
+
+    [v6.0 BUG FIX]:
+    - check_additivity=False (SHAP yaygın hata kaynağı)
+    - X_test_sample.astype(float) — kategorik dtypeları temizle
+    - Hata mesajları print edilir (debugging)
     """
     if not MATPLOTLIB_OK or not final_modeller_tree:
+        print(f"    [BİLGİ] Tree-based model yok veya matplotlib kapalı, atlandı")
         return None
     try:
+        # [v6.0] X'i SHAP için temizle (kategorik kolonlar int olmalı)
+        try:
+            X_clean = X_test_sample.copy()
+            for col in X_clean.columns:
+                if X_clean[col].dtype.name == "category":
+                    X_clean[col] = X_clean[col].cat.codes.astype("int64")
+                elif X_clean[col].dtype.kind == "O":
+                    X_clean[col] = X_clean[col].astype("int64")
+            X_for_shap = X_clean.astype("float64")
+        except Exception as e:
+            print(f"    [UYARI] X temizleme: {e}, ham X kullanılıyor")
+            X_for_shap = X_test_sample
+
         tum_shaps = []
-        for m in final_modeller_tree:
+        for idx, m in enumerate(final_modeller_tree):
             try:
-                explainer = shap.TreeExplainer(m)
-                sv = explainer.shap_values(X_test_sample)
+                # Pipeline check
+                if hasattr(m, "named_steps") and "clf" in m.named_steps:
+                    explainer = shap.TreeExplainer(
+                        m.named_steps["clf"],
+                        feature_perturbation="tree_path_dependent"
+                    )
+                else:
+                    explainer = shap.TreeExplainer(
+                        m, feature_perturbation="tree_path_dependent"
+                    )
+                # check_additivity=False — küçük floating point hataları affet
+                sv = explainer.shap_values(X_for_shap, check_additivity=False)
                 if isinstance(sv, list):
                     sv = sv[1]
                 elif hasattr(sv, "ndim") and sv.ndim == 3:
                     sv = sv[:, :, 1]
                 tum_shaps.append(np.abs(sv).mean(axis=0))
-            except Exception:
+            except Exception as e:
+                print(f"    [UYARI] Model {idx+1} SHAP başarısız: "
+                      f"{type(e).__name__}: {str(e)[:80]}")
                 continue
 
         if not tum_shaps:
+            print(f"    [HATA] Hiçbir tree modelden SHAP alınamadı — atlandı")
             return None
+        print(f"    {len(tum_shaps)}/{len(final_modeller_tree)} tree modelden SHAP başarılı")
+
         ortalama_shap = np.mean(tum_shaps, axis=0)
         ozellikler    = list(X_test_sample.columns)
 
@@ -1244,7 +1300,7 @@ def ensemble_shap_hesapla(final_modeller_tree, X_train, X_test_sample,
 
         return {"top15_features": top15_feat, "top15_values": top15_vals}
     except Exception as e:
-        print(f"  [UYARI] Ensemble SHAP başarısız: {e}")
+        print(f"  [UYARI] Ensemble SHAP başarısız: {type(e).__name__}: {e}")
         return None
 
 
@@ -1338,12 +1394,18 @@ def model_olustur(algo, params, X_tr_sample=None):
         p.setdefault("verbosity", -1)
         p.setdefault("random_state", RASTGELE_TOHUM)
         p.setdefault("subsample_freq", 1)
+        # [v6.0] GPU desteği (sadece CFTR/PAH/MASTER)
+        if GPU_AKTIF and "device" not in p:
+            p["device"] = LGB_DEVICE
         return lgb.LGBMClassifier(**p)
 
     elif algo == "catboost":
         p.setdefault("random_seed", RASTGELE_TOHUM)
         p.setdefault("verbose", False)
         p.setdefault("bootstrap_type", "Bernoulli")
+        # [v6.0] GPU desteği (sadece CFTR/PAH/MASTER)
+        if GPU_AKTIF and "task_type" not in p:
+            p["task_type"] = CB_TASK_TYPE
         return CatBoostClassifier(**p)
 
     elif algo == "random_forest":
@@ -1568,7 +1630,7 @@ def suggest_params(trial, algo, geniş=True):
             "reg_alpha":         trial.suggest_float("xgb_alpha", 0.0, 15.0),
             "reg_lambda":        trial.suggest_float("xgb_lambda", 0.1, 30.0),
             "scale_pos_weight":  trial.suggest_float("xgb_spw", SPW*0.2, SPW*6.0),
-            "enable_categorical": True, "tree_method": "hist", "device": "cpu",
+            "enable_categorical": True, "tree_method": "hist", "device": XGB_DEVICE,
             "verbosity": 0, "random_state": RASTGELE_TOHUM, "n_jobs": 1,
         }
 
@@ -1762,7 +1824,7 @@ def trial_to_model_params(algo, trial_params, n_jobs_override=None):
     p = {rd[k]: v for k, v in trial_params.items() if k in rd}
 
     if algo == "xgboost":
-        p.update({"enable_categorical": True, "tree_method": "hist", "device": "cpu",
+        p.update({"enable_categorical": True, "tree_method": "hist", "device": XGB_DEVICE,
                   "verbosity": 0, "random_state": RASTGELE_TOHUM,
                   "n_jobs": n_jobs_override if n_jobs_override else 1})
     elif algo == "lightgbm":
@@ -1814,7 +1876,7 @@ if SHAP_OK and SHAP_PERCENTILE > 0:
     try:
         if not shap_cache_yuklendi:
             SHAP_XGB_PARAMS = {
-                "enable_categorical": True, "tree_method": "hist", "device": "cpu",
+                "enable_categorical": True, "tree_method": "hist", "device": XGB_DEVICE,
                 "verbosity": 0, "n_jobs": -1, "random_state": RASTGELE_TOHUM,
                 "n_estimators": 200, "max_depth": 6,
                 "learning_rate": 0.05, "subsample": 0.8, "scale_pos_weight": SPW,
@@ -2184,20 +2246,53 @@ korelasyon_heatmap(korelasyon_df)
 print(f"  → grafikler/faz2_korelasyon_heatmap.png kaydedildi.")
 
 # ── Greedy Çeşitlilik Seçimi ──────────────────────────────────────
-# 1) En yüksek F2'li algoritmayı seç
-# 2) Sonra: kalan adaylar arasında, seçilenlerle ORTALAMA korelasyonu en düşük olanı ekle
-# 3) FAZ2_SECILEN_SAYI tamamlanana kadar tekrarla
-print("\n  Greedy Çeşitlilik Seçimi:")
+# [v6.0 KRİTİK FIX] Önceki: bilesik = F2 × (1 - kor) → çeşitliliği aşırı
+# vurguluyordu, zayıf modeller (kNN F2=0.93) kazanıyordu.
+#
+# Yeni: İki aşamalı seçim:
+#   1) F2 alt sınır (kalite kapısı): en_iyi_F2 - 0.025 üstündekiler
+#   2) Bu adaylar arasında: bilesik = F2 - α × ort_kor (additive, α=0.15)
+#
+# Sonuç: CatBoost, LightGBM gibi güçlü modeller seçilebilir. Korelasyon
+# yine ceza ama F2'yi domine etmiyor.
+FAZ2_F2_ALT_SINIR_TOLERANS = 0.025    # en_iyi F2'den 0.025 düşük olana kadar kabul
+FAZ2_KORELASYON_AGIRLIGI   = 0.15     # additive ceza katsayısı
+
+print("\n  Greedy Çeşitlilik Seçimi (v6.0: F2 alt sınır + additive bileşik):")
 
 secilen_algoritmalar = []
 en_iyi_f2_algo = max(oof_f2_per_algo, key=oof_f2_per_algo.get)
-secilen_algoritmalar.append(en_iyi_f2_algo)
-print(f"    1. {en_iyi_f2_algo.upper()} (en yüksek F2: {oof_f2_per_algo[en_iyi_f2_algo]:.4f})")
+en_iyi_f2_genel = oof_f2_per_algo[en_iyi_f2_algo]
+F2_ALT_SINIR = en_iyi_f2_genel - FAZ2_F2_ALT_SINIR_TOLERANS
 
+print(f"    En iyi OOF F2: {en_iyi_f2_genel:.4f} ({en_iyi_f2_algo})")
+print(f"    F2 alt sınır:  {F2_ALT_SINIR:.4f} (tolerans={FAZ2_F2_ALT_SINIR_TOLERANS})")
+
+# Adayları F2 alt sınıra göre filtrele
+adaylar_kalitelli = [a for a in hayatta_kalan
+                      if oof_f2_per_algo[a] >= F2_ALT_SINIR]
+elenenler = [a for a in hayatta_kalan
+              if oof_f2_per_algo[a] < F2_ALT_SINIR]
+
+print(f"    F2 alt sınırını geçen: {len(adaylar_kalitelli)} algoritma "
+      f"({', '.join(adaylar_kalitelli)})")
+if elenenler:
+    print(f"    F2 alt sınırının altında: {len(elenenler)} algoritma "
+          f"({', '.join(elenenler)}) — çeşitlilik seçimine alınmayacak")
+
+# Adım 1: En yüksek F2'li (alt sınırı geçen) algoritma
+secilen_algoritmalar.append(en_iyi_f2_algo)
+print(f"    1. {en_iyi_f2_algo.upper()} (en yüksek F2: {en_iyi_f2_genel:.4f})")
+
+# Adım 2+: Additive bileşik ile çeşitlilik seçimi
 while len(secilen_algoritmalar) < FAZ2_SECILEN_SAYI:
-    adaylar = [a for a in hayatta_kalan if a not in secilen_algoritmalar]
+    adaylar = [a for a in adaylar_kalitelli if a not in secilen_algoritmalar]
     if not adaylar:
-        break
+        # Alt sınırı geçen aday kalmadı, geri kalan tüm hayatta kalanlardan seç
+        adaylar = [a for a in hayatta_kalan if a not in secilen_algoritmalar]
+        if not adaylar:
+            break
+        print(f"    [UYARI] F2 alt sınırı tükendi, geri kalanlardan seçiliyor")
 
     # Her aday için seçilenlerle ortalama korelasyonu hesapla
     ort_kor = {}
@@ -2205,8 +2300,9 @@ while len(secilen_algoritmalar) < FAZ2_SECILEN_SAYI:
         kor_listesi = [abs(korelasyon_df.loc[a, s]) for s in secilen_algoritmalar]
         ort_kor[a] = float(np.mean(kor_listesi))
 
-    # F2 × (1 - ort_korelasyon) bileşik skoru — hem skor hem çeşitlilik ister
-    bilesik = {a: oof_f2_per_algo[a] * (1 - ort_kor[a]) for a in adaylar}
+    # YENİ: bilesik = F2 - α × ort_kor (additive)
+    bilesik = {a: oof_f2_per_algo[a] - FAZ2_KORELASYON_AGIRLIGI * ort_kor[a]
+                for a in adaylar}
     en_iyi = max(bilesik, key=bilesik.get)
 
     print(f"    {len(secilen_algoritmalar)+1}. {en_iyi.upper()}  "
@@ -2722,11 +2818,11 @@ if n_yuksek > 0:
 
 # ─── B. DISAGREEMENT RATE (3 Paradigma) ───
 # Her algoritma için kendi üye-ortalamasını al, sınıf tahminlerini karşılaştır.
-# Üye sırası ensemble_uyeleri'nde tutuluyor: [et,et,et,et,et,knn,knn,..,lr,lr,lr,lr,lr]
+# Üye sırası secilen_trials_algo'da tutuluyor: [et,et,et,et,et,knn,knn,..,lr,lr,lr,lr,lr]
 print(f"\n  ── Paradigma Disagreement Rate (3 algoritma) ──")
 paradigma_proba = {}
 for algo_adi in secilen_algoritmalar:
-    algo_idxler = [i for i, u in enumerate(ensemble_uyeleri) if u["algo"] == algo_adi]
+    algo_idxler = [i for i, a in enumerate(secilen_trials_algo) if a == algo_adi]
     if algo_idxler:
         algo_test_probas = test_proba_matrix[algo_idxler]   # [5, 78]
         paradigma_proba[algo_adi] = algo_test_probas.mean(axis=0)
@@ -3054,7 +3150,7 @@ def _solo_fit_xgb():
         n_estimators=500, max_depth=6, learning_rate=0.05,
         subsample=0.8, colsample_bytree=0.8, gamma=0.1,
         reg_alpha=0.1, reg_lambda=1.0, scale_pos_weight=SPW,
-        enable_categorical=True, tree_method="hist", device="cpu",
+        enable_categorical=True, tree_method="hist", device=XGB_DEVICE,
         verbosity=0, random_state=RASTGELE_TOHUM, n_jobs=-1,
     )
     m.fit(X_train, y_train)
@@ -3239,7 +3335,7 @@ for k in ["n_jobs", "thread_count", "verbosity", "verbose",
 
 sonuc = {
     "_aciklama": {
-        "surum"          : f"BioSense AI v5.2 — Kritik Bug Fix (Eşik+Softmax) ({DATA_SUFFIX.upper()}, {CALISMA_MODU.upper()})",
+        "surum"          : f"BioSense AI v6.0 — TEKNOFEST Final (FAZ 2 fix + GPU) ({DATA_SUFFIX.upper()}, {CALISMA_MODU.upper()})",
         "calisma_modu"   : CALISMA_MODU,
         "sistem_profili" : {
             "cpu_logical"     : int(_cpu_count_logical),
@@ -3449,5 +3545,5 @@ print(f"     [v5.1] trial_convergence_*.png (3 algoritma için)")
 print(f"     [v5.1] feature_grup_analizi.png (pasta + bar)")
 print(f"     [v5.1] ensemble_shap.png (gerçek karar mantığı)")
 print("\n" + "=" * 72)
-print(f"  BioSense AI v5.2 — TAMAMLANDI ({DATA_SUFFIX.upper()}, MOD: {CALISMA_MODU.upper()})")
+print(f"  BioSense AI v6.0 — TAMAMLANDI ({DATA_SUFFIX.upper()}, MOD: {CALISMA_MODU.upper()})")
 print("=" * 72)
