@@ -1,16 +1,17 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  BioSense AI v2.2 — MUTLAK KUSURSUZ (GECE MODU / NO-CRASH GUARANTEE)         ║
+║  BioSense AI v2.8 — NİHAİ HATA DÜZELTMELERİ                                 ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  DÜZELTMELER (v2.2):                                                         ║
-║   ✓ CRASH #3 (ÖNLENDİ) CMA-ES Kategorik Parametre hatası kökünden çözüldü.   ║
-║   ✓ CRASH #4 (ÖNLENDİ) SQLite Timeout 240 sn yapıldı, 24 çekirdek ezilmeyecek║
-║   ✓ CRASH #5 (ÖNLENDİ) JSON Numpy Float Casting hataları (TypeError) giderildi║
-║   ✓ CRASH #6 (ÖNLENDİ) CatBoost boş kategorik liste (empty cat_features) fix ║
-║  YENİ F2 OPTİMİZASYONLARI & TEKNOFEST ÖZEL:                                  ║
-║   ✓ FAZ2 kazanan algoritmaya otomatik odaklanır (FAZ1 sonucuna göre)         ║
-║   ✓ Benzersiz olasılık eşik araması (grid'den daha hassas)                   ║
-║   ✓ TEKNOFEST: Her algoritmanın zirve skoru ve parametreleri JSON'a eklenir. ║
+║  v2.3→v2.4: FIX #1-5   ES sızıntısı, SHAP zamanlama, algo seçim, stratify   ║
+║  v2.4→v2.5: FIX #6-9   seed filtre, stratify, roc_auc kapsam, aralik algo   ║
+║  v2.5→v2.6: FIX #10-12 oof crash, display tutarlık, faz2 index guard        ║
+║  v2.6→v2.7: FIX #13-16 SHAP 3D, oof prior, [7/7] prior, params_coz filtre   ║
+║  v2.7→v2.8:                                                                  ║
+║   ✓ FIX #17 en_iyi_f2_esik_benzersiz: filtre boşsa orijinal prob kullan      ║
+║             (prob 0.01/0.99 dışındaysa sıfır F2 döndürme hatası giderildi)  ║
+║   ✓ FIX #18 SHAP bar: max(mean_abs_shap) sıfırsa ZeroDivisionError önlendi  ║
+║   ✓ FIX #19 FAZ2 enqueue: tek-algo modunda "algorithm" key kuyruğa girmiyor ║
+║   ✓ FIX #20 roc_auc_score: [6/7] ve [7/7]'de try/except eklendi             ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -76,8 +77,12 @@ OOF_TEKRAR     = 10
 OOF_ES_SPLIT   = 0.12       # OOF fold içi erken-dur ayrımı (%12)
 
 EARLY_STOP_ROUNDS  = 50
+# [FIX #1] Objective içi ES ayrım parametreleri
+ES_SPLIT_OBJECTIVE = 0.10   # tr_idx'in %10'u ES seti olarak ayrılır
+MIN_ES_ORNEKLER    = 8      # ES seti için minimum örnek sayısı
+
 SHAP_PERCENTILE    = 20     # 0 = devre dışı
-W_F2               = 0.80   # Hedef ağırlığı F2 
+W_F2               = 0.80   # Hedef ağırlığı F2
 W_AUC              = 0.20
 SOFTMAX_SICAKLIK   = 10.0
 
@@ -89,7 +94,7 @@ if LGBM_OK: ALGORITMALAR.append("lightgbm")
 if CB_OK:   ALGORITMALAR.append("catboost")
 
 print("=" * 72)
-print("  BioSense AI v2.2 — KUSURSUZ GECE MODU (Zero-Crash)")
+print("  BioSense AI v2.8 — NİHAİ HATA DÜZELTMELERİ")
 print(f"  Algoritmalar: {ALGORITMALAR}")
 print(f"  FAZ1: {FAZ1_TRIAL}t×{FAZ1_FOLDS*FAZ1_TEKRAR}fold  |  "
       f"FAZ2: {FAZ2_TRIAL}t×{FAZ2_FOLDS*FAZ2_TEKRAR}fold")
@@ -146,12 +151,15 @@ BUDANAN_OZELLIKLER = []
 # ══════════════════════════════════════════════════════════════════
 
 def get_algo(t):
-    """Güvenli algoritma çekici (Özellikle CMA-ES için hayat kurtarır)"""
     return t.user_attrs.get("algo", t.params.get("algorithm", "xgboost"))
 
 def en_iyi_f2_esik_benzersiz(y_gercek, problar):
     adaylar = np.unique(problar)
-    adaylar = adaylar[(adaylar > 0.01) & (adaylar < 0.99)]
+    # Önce dar (0.01, 0.99) aralığını dene — kalibre edilmiş olasılıklar burada
+    adaylar_dar = adaylar[(adaylar > 0.01) & (adaylar < 0.99)]
+    # Dar aralık boşsa (çok güvenli model → tüm prob'lar uçlarda) orijinali kullan.
+    # v2.7'de bu durumda (0.50, 0.0) dönüyordu → optimal eşik hiç aranmıyordu.
+    adaylar = adaylar_dar if len(adaylar_dar) > 0 else adaylar
     if len(adaylar) == 0:
         return 0.50, 0.0
     en_iyi_f2  = 0.0
@@ -187,6 +195,46 @@ def softmax_agirliklar(f2_dizi, sicaklik=10.0):
 def rank_ensemble(proba_listesi):
     ranked = [rankdata(p) / len(p) for p in proba_listesi]
     return np.mean(ranked, axis=0)
+
+# ── [FIX #1] Merkezi ES ayrım fonksiyonu ──────────────────────────────────────
+def fold_es_ayir(X_fold_tr, y_fold_tr):
+    """
+    tr_idx içindeki eğitim setini ikiye böler:
+      - Gerçek eğitim seti (modelin fit ettiği)
+      - Early stopping seti (val_idx'ten BAĞIMSIZ)
+    Bu sayede model val_idx'e göre şekillendirilmez → ES sızıntısı önlenir.
+    
+    [FIX #5] stratify crash koruması da içerir.
+    """
+    if len(X_fold_tr) < 30:
+        # Çok küçük fold → ES olmadan devam
+        return X_fold_tr, y_fold_tr, None, None
+
+    n_es = max(MIN_ES_ORNEKLER, int(len(X_fold_tr) * ES_SPLIT_OBJECTIVE))
+
+    # Önce stratify ile dene
+    try:
+        X_tr, X_es, y_tr, y_es = train_test_split(
+            X_fold_tr, y_fold_tr,
+            test_size=n_es,
+            random_state=RASTGELE_TOHUM,
+            stratify=y_fold_tr,
+        )
+        return X_tr, y_tr, X_es, y_es
+    except ValueError:
+        pass
+
+    # [FIX #5] stratify başarısız → stratify'sız dene
+    try:
+        X_tr, X_es, y_tr, y_es = train_test_split(
+            X_fold_tr, y_fold_tr,
+            test_size=n_es,
+            random_state=RASTGELE_TOHUM,
+        )
+        return X_tr, y_tr, X_es, y_es
+    except Exception:
+        # Her şey başarısız → ES olmadan devam
+        return X_fold_tr, y_fold_tr, None, None
 
 def model_fit(algo, params, X_tr, y_tr, X_val=None, y_val=None, n_jobs_override=None):
     use_es = (X_val is not None) and (y_val is not None) and (len(X_val) >= 5)
@@ -241,20 +289,45 @@ def oof_tahmin(algo, params, X_tr, y_tr, n_folds, n_tekrar, n_jobs_override=None
         X_ft = X_tr.iloc[tr_idx]
         y_ft = y_tr[tr_idx]
         X_fv = X_tr.iloc[val_idx]
-        y_fv = y_tr[val_idx]
 
         X_es = y_es = None
         if es_split > 0 and len(tr_idx) >= 20:
-            n_es = max(5, int(len(tr_idx) * es_split))
-            X_ft, X_es, y_ft, y_es = train_test_split(
-                X_ft, y_ft, test_size=n_es, random_state=RASTGELE_TOHUM, stratify=y_ft,
-            )
+            n_es = max(MIN_ES_ORNEKLER, int(len(tr_idx) * es_split))
+            # [FIX #5] stratify crash koruması
+            try:
+                X_ft, X_es, y_ft, y_es = train_test_split(
+                    X_ft, y_ft, test_size=n_es, random_state=RASTGELE_TOHUM, stratify=y_ft,
+                )
+            except ValueError:
+                try:
+                    X_ft, X_es, y_ft, y_es = train_test_split(
+                        X_ft, y_ft, test_size=n_es, random_state=RASTGELE_TOHUM,
+                    )
+                except Exception:
+                    X_es = y_es = None
 
-        m = model_fit(algo, params, X_ft, y_ft, X_es, y_es, n_jobs_override=n_jobs_override)
-        toplam[val_idx] += m.predict_proba(X_fv)[:, 1]
-        sayac[val_idx]  += 1
+        # [FIX] model_fit + predict_proba tek try bloğunda.
+        # Objective'de n_jobs=1 ile çalışan params, burada n_jobs=-1 ile
+        # çalıştırılıyor. CatBoost thread_count=-1 gibi durumlar bazı
+        # ortamlarda hata fırlatabilir. Crash yerine fold atlanıyor;
+        # sayac artmadığından o örnekler için 0.0 dönmez, toplam/sayac
+        # bölümü zaten np.maximum(sayac,1) ile korunuyor.
+        try:
+            m          = model_fit(algo, params, X_ft, y_ft, X_es, y_es,
+                                   n_jobs_override=n_jobs_override)
+            fold_proba = m.predict_proba(X_fv)[:, 1]
+            toplam[val_idx] += fold_proba
+            sayac[val_idx]  += 1
+        except Exception:
+            pass   # bu fold atlandı
 
-    return toplam / np.maximum(sayac, 1)
+    # Skip edilen foldların örnekleri için 0.0 yerine class prior kullan.
+    # 0.0 isotonic regression'ı ve eşik aramasını bozar; prior nötr bir
+    # başlangıç noktası sağlar.
+    prior = float(y_tr.mean())
+    sonuc = toplam / np.maximum(sayac, 1)
+    sonuc[sayac == 0] = prior
+    return sonuc
 
 def params_coz(algo, trial_params, n_jobs_override=None):
     if algo == "xgboost":
@@ -267,7 +340,9 @@ def params_coz(algo, trial_params, n_jobs_override=None):
             "xgb_alpha": "reg_alpha", "xgb_lambda": "reg_lambda",
             "xgb_spw": "scale_pos_weight",
         }
-        p = {rename.get(k, k): v for k, v in trial_params.items() if k not in ("algorithm",)}
+        # Sadece rename sözlüğünde olan anahtarlar alınır.
+        # Bilinmeyen / yabancı-algo anahtarları (lgb_*, cb_*) sessizce atılır.
+        p = {rename[k]: v for k, v in trial_params.items() if k in rename}
         p.update({"enable_categorical": True, "tree_method": "hist",
                   "device": "cpu", "verbosity": 0, "random_state": RASTGELE_TOHUM,
                   "n_jobs": n_jobs_override if n_jobs_override else 1})
@@ -281,7 +356,7 @@ def params_coz(algo, trial_params, n_jobs_override=None):
             "lgb_lambda": "reg_lambda", "lgb_msg": "min_split_gain",
             "lgb_spw": "scale_pos_weight",
         }
-        p = {rename.get(k, k): v for k, v in trial_params.items() if k not in ("algorithm",)}
+        p = {rename[k]: v for k, v in trial_params.items() if k in rename}
         p.update({"verbosity": -1, "random_state": RASTGELE_TOHUM, "subsample_freq": 1,
                   "n_jobs": n_jobs_override if n_jobs_override else 1})
 
@@ -292,7 +367,7 @@ def params_coz(algo, trial_params, n_jobs_override=None):
             "cb_mdl": "min_data_in_leaf", "cb_sub": "subsample",
             "cb_cbl": "colsample_bylevel", "cb_spw": "scale_pos_weight",
         }
-        p = {rename.get(k, k): v for k, v in trial_params.items() if k not in ("algorithm",)}
+        p = {rename[k]: v for k, v in trial_params.items() if k in rename}
         p.update({"random_seed": RASTGELE_TOHUM, "verbose": False,
                   "thread_count": n_jobs_override if n_jobs_override else 1})
     else:
@@ -304,11 +379,70 @@ def aralik_hesapla(trials, param_adi, yuzde_alt=5, yuzde_ust=95):
     if not degerler: return None, None
     return (float(np.percentile(degerler, yuzde_alt)), float(np.percentile(degerler, yuzde_ust)))
 
+# ══════════════════════════════════════════════════════════════════
+#  2. SHAP ÖZELLİK BUDAMA  ← [FIX #2] FAZ 1'den ÖNCE taşındı
+#     Sebep: FAZ 1 ve FAZ 2 aynı özellik uzayında optimize edilmeli.
+#     v2.3'te FAZ 1 N özellik, FAZ 2 0.8N özellik görüyordu →
+#     FAZ 1'in optimal paramları FAZ 2'ye yanlış seed oluyordu.
+# ══════════════════════════════════════════════════════════════════
+print(f"\n[2/7] SHAP özellik budama (alt %{SHAP_PERCENTILE} atılıyor) — FAZ 1 öncesi...")
+if SHAP_OK and SHAP_PERCENTILE > 0:
+    try:
+        SHAP_XGB_PARAMS = {
+            "enable_categorical": True, "tree_method": "hist", "device": "cpu",
+            "verbosity": 0, "n_jobs": -1, "random_state": RASTGELE_TOHUM,
+            "n_estimators": 200, "max_depth": 6,
+            "learning_rate": 0.05, "subsample": 0.8, "scale_pos_weight": SPW,
+        }
+        print("  SHAP referans modeli (XGBoost) eğitiliyor...")
+        shap_model = xgb.XGBClassifier(**SHAP_XGB_PARAMS)
+        shap_model.fit(X_train, y_train)
+
+        explainer   = shap.TreeExplainer(shap_model)
+        shap_values = explainer.shap_values(X_train)
+        # Eski SHAP API  : list döndürür → [neg_class, pos_class]
+        # Yeni SHAP API  : 2D (n,f) veya 3D (n,f,2) array döndürür
+        if isinstance(shap_values, list):
+            shap_values = shap_values[1]
+        elif hasattr(shap_values, "ndim") and shap_values.ndim == 3:
+            shap_values = shap_values[:, :, 1]
+        # ndim==2 → doğrudan pozitif sınıf SHAP değerleri
+
+        all_cols      = list(X_train.columns)
+        mean_abs_shap = np.abs(shap_values).mean(axis=0)
+
+        print("\n  Top 10 SHAP Özelliği:")
+        onem_sirasi = np.argsort(mean_abs_shap)[::-1]
+        shap_max = max(float(mean_abs_shap.max()), 1e-9)   # sıfır bölme koruması
+        for rk in onem_sirasi[:10]:
+            bar = "█" * int(mean_abs_shap[rk] / shap_max * 35)
+            print(f"    {all_cols[rk]:<30} {bar}  {mean_abs_shap[rk]:.5f}")
+
+        shap_esik  = np.percentile(mean_abs_shap, SHAP_PERCENTILE)
+        kalan_mask = mean_abs_shap >= shap_esik
+        kalan_cols = [c for c, keep in zip(all_cols, kalan_mask) if keep]
+        budanan_cnt = len(all_cols) - len(kalan_cols)
+
+        X_train       = X_train[kalan_cols]
+        X_test        = X_test[kalan_cols]
+        KAT_KOLONLAR  = [c for c in KAT_KOLONLAR if c in kalan_cols]
+        BUDANAN_OZELLIKLER = [c for c in all_cols if c not in kalan_cols]
+
+        print(f"\n  {len(kalan_cols)} özellik kaldı ({budanan_cnt} gürültülü özellik budandı)")
+        del shap_values, shap_model, explainer
+        gc.collect()
+    except Exception as e:
+        print(f"  [UYARI] SHAP budama başarısız: {e}")
+        BUDANAN_OZELLIKLER = []
+else:
+    print("  SHAP budama devre dışı.")
 
 # ══════════════════════════════════════════════════════════════════
-#  2. FAZ 1 — GENİŞ HETEROJEN TPE
+#  3. FAZ 1 — GENİŞ HETEROJEN TPE
+#     [FIX #1] Her fold'da tr_idx → (eğitim + ES) olarak bölünüyor.
+#     Val_idx sadece performans ölçümüne dokunuyor, ES'e değil.
 # ══════════════════════════════════════════════════════════════════
-print(f"\n[2/7] FAZ 1: {FAZ1_TRIAL} trial × {FAZ1_FOLDS*FAZ1_TEKRAR} fold")
+print(f"\n[3/7] FAZ 1: {FAZ1_TRIAL} trial × {FAZ1_FOLDS*FAZ1_TEKRAR} fold")
 print("-" * 72)
 
 def faz1_objective(trial):
@@ -364,17 +498,26 @@ def faz1_objective(trial):
     rskf = RepeatedStratifiedKFold(n_splits=FAZ1_FOLDS, n_repeats=FAZ1_TEKRAR, random_state=RASTGELE_TOHUM)
     f2_listesi  = []
     auc_listesi = []
-    RAPOR_ADIMI = [FAZ1_FOLDS * FAZ1_TEKRAR // 4, FAZ1_FOLDS * FAZ1_TEKRAR // 2]
+    RAPOR_ADIMI = {FAZ1_FOLDS * FAZ1_TEKRAR // 4, FAZ1_FOLDS * FAZ1_TEKRAR // 2}
 
     for fold_no, (tr_idx, val_idx) in enumerate(rskf.split(X_train, y_train)):
+        # [FIX #1] tr_idx içinde ES ayrımı: val_idx kirlenmiyor
+        X_fold_tr, y_fold_tr, X_fold_es, y_fold_es = fold_es_ayir(
+            X_train.iloc[tr_idx], y_train[tr_idx]
+        )
+        # [FIX #8] model_fit + predict + roc_auc hepsi aynı try bloğunda:
+        # roc_auc_score dejenere model (tek sınıf prob) durumunda ValueError
+        # fırlatır; try dışında kalırsa trial FAILED olarak işaretlenir ve
+        # pruner istatistikleri bozulur.
         try:
-            m = model_fit(algo, params, X_train.iloc[tr_idx], y_train[tr_idx], X_train.iloc[val_idx], y_train[val_idx])
+            m    = model_fit(algo, params, X_fold_tr, y_fold_tr, X_fold_es, y_fold_es)
+            prob = m.predict_proba(X_train.iloc[val_idx])[:, 1]
+            _, f2 = en_iyi_f2_esik_grid(y_train[val_idx], prob, adim=0.01)
+            auc   = roc_auc_score(y_train[val_idx], prob)
         except Exception:
             return 0.0
 
-        prob = m.predict_proba(X_train.iloc[val_idx])[:, 1]
-        _, f2 = en_iyi_f2_esik_grid(y_train[val_idx], prob, adim=0.01)
-        auc   = roc_auc_score(y_train[val_idx], prob)
+        # Ölçüm tamamen bağımsız val_idx üzerinde
         f2_listesi.append(f2)
         auc_listesi.append(auc)
 
@@ -393,21 +536,37 @@ faz1_study = optuna.create_study(
     direction="maximize",
     storage=optuna.storages.RDBStorage(
         url=FAZ1_DB,
-        # 🔥 ŞEBNUS DOKUNUŞU: 24 Çekirdeği kaldıracak 240 saniyelik Zırh
-        engine_kwargs={"connect_args": {"timeout": 240, "check_same_thread": False}}, 
+        engine_kwargs={"connect_args": {"timeout": 360, "check_same_thread": False}},  # 240→360
     ),
     load_if_exists=True,
-    sampler=optuna.samplers.TPESampler(seed=RASTGELE_TOHUM, n_startup_trials=80, multivariate=True, warn_independent_sampling=False),
+    sampler=optuna.samplers.TPESampler(
+        seed=RASTGELE_TOHUM, n_startup_trials=80,
+        multivariate=True, warn_independent_sampling=False
+    ),
     pruner=optuna.pruners.MedianPruner(n_startup_trials=50, n_warmup_steps=5, interval_steps=5),
 )
 
+# 🔥 ŞEBNUS ÖLÜMSÜZ MODU: FAZ 1
 faz1_mevcut = len([t for t in faz1_study.trials if t.state == optuna.trial.TrialState.COMPLETE])
 faz1_kalan  = max(0, FAZ1_TRIAL - faz1_mevcut)
 
 if faz1_kalan > 0:
     print(f"  Mevcut: {faz1_mevcut} | Kalan: {faz1_kalan}")
     t0 = time.perf_counter()
-    faz1_study.optimize(faz1_objective, n_trials=faz1_kalan, n_jobs=PARALEL_ISCI, show_progress_bar=True, catch=(Exception,))
+    while faz1_kalan > 0:
+        try:
+            faz1_study.optimize(faz1_objective, n_trials=faz1_kalan, n_jobs=PARALEL_ISCI,
+                                show_progress_bar=True, catch=(Exception,))
+            break
+        except Exception as e:
+            if "Cannot tell" in str(e) or "database is locked" in str(e):
+                print(f"\n  [ŞEBNUS KORUMASI] Optuna iç çekirdek çakışması yakalandı: {e}")
+                print("  Kaldığı yerden devam ediyor...")
+                time.sleep(1)
+            else:
+                raise e
+        faz1_mevcut = len([t for t in faz1_study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+        faz1_kalan  = max(0, FAZ1_TRIAL - faz1_mevcut)
     print(f"  FAZ 1 bitti: {time.perf_counter()-t0:.1f}s")
 else:
     print(f"  FAZ 1 zaten tamamlandı ({faz1_mevcut} trial), DB'den yükleniyor.")
@@ -422,91 +581,67 @@ for t in faz1_study.trials:
         algo_skorlar.setdefault(a, []).append(t.value)
 
 print("\n  Algoritma Performansı (FAZ 1):")
-for a in sorted(algo_skorlar, key=lambda x: np.max(algo_skorlar.get(x, [0])), reverse=True):
+# [FIX] v2.4'te display max ile sıralıyordu, FAZ2 seçimi top-50 ort ile yapılıyordu.
+# Aynı kriteri kullanarak tutarsızlık giderildi: ekranda hangi algo birinci
+# görünüyorsa FAZ2 da onu seçiyor.
+for a in sorted(algo_skorlar,
+                key=lambda x: np.mean(sorted(algo_skorlar.get(x, [0]), reverse=True)[:50]),
+                reverse=True):
     vals = algo_skorlar[a]
     print(f"    {a:<12}  trial={len(vals):4d}  ort={np.mean(vals):.4f}  maks={np.max(vals):.4f}")
 
-faz1_tamamlanan = [t for t in faz1_study.trials if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None]
+faz1_tamamlanan = [t for t in faz1_study.trials
+                   if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None]
 faz1_top20 = sorted(faz1_tamamlanan, key=lambda t: t.value, reverse=True)[:20]
 
-# ── FAZ2 için kazanan algoritmayı belirle ──────────────────────────
-en_iyi_algo_faz1 = max(algo_skorlar, key=lambda a: max(algo_skorlar.get(a, [0]))) if algo_skorlar else "xgboost"
-print(f"\n  FAZ 2 odak algoritması: {en_iyi_algo_faz1.upper()} (FAZ 1 galibi)")
+# ── [FIX #4] Galip algoritma seçimi ───────────────────────────────────────────
+# v2.3: galip seçimi max() ile, eleme kriteri top-50 ort. ile → TUTARSIZLIK
+# v2.4: ikisi de top-50 ort. → tutarlı ve istatistiksel olarak daha sağlam
+def algo_top50_ort(algo_adi):
+    return np.mean(sorted(algo_skorlar.get(algo_adi, [0]), reverse=True)[:50])
+
+en_iyi_algo_faz1 = max(ALGORITMALAR, key=algo_top50_ort) if algo_skorlar else "xgboost"
+print(f"\n  FAZ 2 odak algoritması: {en_iyi_algo_faz1.upper()} (FAZ 1 galibi — top-50 ort.)")
 
 ALGORITMALAR_FAZ2 = list(ALGORITMALAR)
 if len(ALGORITMALAR) > 1:
-    maks_ort_galip   = np.mean(sorted(algo_skorlar.get(en_iyi_algo_faz1, [0]), reverse=True)[:50])
-    diger_algo_maks  = max((np.mean(sorted(algo_skorlar.get(a, [0]), reverse=True)[:50]) for a in ALGORITMALAR if a != en_iyi_algo_faz1), default=0.0)
+    maks_ort_galip  = algo_top50_ort(en_iyi_algo_faz1)
+    diger_algo_maks = max(
+        (algo_top50_ort(a) for a in ALGORITMALAR if a != en_iyi_algo_faz1),
+        default=0.0
+    )
     if maks_ort_galip - diger_algo_maks >= 0.01:
         ALGORITMALAR_FAZ2 = [en_iyi_algo_faz1]
-        print(f"  FAZ 2 yalnızca {en_iyi_algo_faz1} kullanacak (fark ≥ 0.01 skor puanı).")
+        print(f"  FAZ 2 yalnızca {en_iyi_algo_faz1} kullanacak (fark ≥ 0.01 skor).")
 
 # ══════════════════════════════════════════════════════════════════
-#  3. SHAP ÖZELLİK BUDAMA
-# ══════════════════════════════════════════════════════════════════
-print(f"\n[3/7] SHAP özellik budama (alt %{SHAP_PERCENTILE} atılıyor)...")
-if SHAP_OK and SHAP_PERCENTILE > 0:
-    try:
-        SHAP_XGB_PARAMS = {
-            "enable_categorical": True, "tree_method": "hist", "device": "cpu", "verbosity": 0, "n_jobs": -1,
-            "random_state": RASTGELE_TOHUM, "n_estimators": 200, "max_depth": 6,
-            "learning_rate": 0.05, "subsample": 0.8, "scale_pos_weight": SPW,
-        }
-        print("  SHAP referans modeli (XGBoost) eğitiliyor...")
-        shap_model = xgb.XGBClassifier(**SHAP_XGB_PARAMS)
-        shap_model.fit(X_train, y_train)
-
-        explainer   = shap.TreeExplainer(shap_model)
-        shap_values = explainer.shap_values(X_train)
-        if isinstance(shap_values, list): shap_values = shap_values[1]
-
-        all_cols      = list(X_train.columns)
-        mean_abs_shap = np.abs(shap_values).mean(axis=0)
-
-        print("\n  Top 10 SHAP Özelliği:")
-        onem_sirasi = np.argsort(mean_abs_shap)[::-1]
-        for rk in onem_sirasi[:10]:
-            bar = "█" * int(mean_abs_shap[rk] / max(mean_abs_shap) * 35)
-            print(f"    {all_cols[rk]:<30} {bar}  {mean_abs_shap[rk]:.5f}")
-
-        shap_esik  = np.percentile(mean_abs_shap, SHAP_PERCENTILE)
-        kalan_mask = mean_abs_shap >= shap_esik
-        kalan_cols = [c for c, keep in zip(all_cols, kalan_mask) if keep]
-        budanan_cnt = len(all_cols) - len(kalan_cols)
-
-        X_train       = X_train[kalan_cols]
-        X_test        = X_test[kalan_cols]
-        KAT_KOLONLAR  = [c for c in KAT_KOLONLAR if c in kalan_cols]
-        BUDANAN_OZELLIKLER = [c for c in all_cols if c not in kalan_cols]
-
-        print(f"\n  {len(kalan_cols)} özellik kaldı ({budanan_cnt} gürültülü özellik budandı)")
-        del shap_values, shap_model, explainer
-        gc.collect()
-    except Exception as e:
-        print(f"  [UYARI] SHAP budama başarısız: {e}")
-        BUDANAN_OZELLIKLER = []
-else:
-    print("  SHAP budama devre dışı.")
-
-# ══════════════════════════════════════════════════════════════════
-#  4. FAZ 2 — DAR KESINLEŞTIRME
+#  4. FAZ 2 — DAR KESİNLEŞTİRME
+#     [FIX #1] Aynı fold_es_ayir() koruması burada da aktif.
+#     [İYİLEŞTİRME] CMA-ES tek algo seçilirse worker sayısı sınırlanıyor:
+#       CMA-ES sıralı öğrenme gerektirir. Yüksek n_jobs ile paralel worker'lar
+#       tamamlanan trial sonuçlarını beklemeden yeni trial önerir → CMA-ES'in
+#       kovaryans güncellemesi bozulur, rastgele aramaya degrade olur.
+#       n_jobs=6 → 6 paralel worker + CMA-ES hâlâ anlamlı güncelleme yapabilir.
 # ══════════════════════════════════════════════════════════════════
 print(f"\n[4/7] FAZ 2: {FAZ2_TRIAL} trial × {FAZ2_FOLDS*FAZ2_TEKRAR} fold")
 print("-" * 72)
 
 def faz2_objective(trial):
-    # 🔥 ŞEBNUS DOKUNUŞU: CMA-ES BOMBASI İMHA EDİLDİ
-    # Eğer FAZ 2'ye tek algoritma geçtiyse, "suggest_categorical" YAPMA! 
-    # CMA-ES sadece float/int destekler, aksi takdirde anında patlar.
     if len(ALGORITMALAR_FAZ2) > 1:
         algo = trial.suggest_categorical("algorithm", ALGORITMALAR_FAZ2)
     else:
         algo = ALGORITMALAR_FAZ2[0]
-    
+
     trial.set_user_attr("algo", algo)
 
+    # [FIX #9] aralik_hesapla artık YALNIZCA bu trial'ın algoritmasına ait
+    # FAZ1 trial'larına bakıyor. v2.4'te tüm faz1_top20 kullanılıyordu:
+    # top20'nin çoğu farklı algoritmadan geliyorsa xgb_n_est gibi parametreler
+    # için hiç değer bulunamıyor (None,None) ve arama tam genişliğe dönüyordu.
+    faz1_top20_algo = [t for t in faz1_top20 if get_algo(t) == algo]
+
     def dar_float(key, abs_lo, abs_hi, genislet=0.20):
-        lo, hi = aralik_hesapla(faz1_top20, key)
+        lo, hi = aralik_hesapla(faz1_top20_algo, key)
         if lo is None: return abs_lo, abs_hi
         aralik = hi - lo
         return (max(abs_lo, lo - aralik * genislet), min(abs_hi, hi + aralik * genislet))
@@ -516,9 +651,9 @@ def faz2_objective(trial):
         return max(abs_lo, int(lo)), min(abs_hi, int(hi) + 1)
 
     if algo == "xgboost":
-        n_lo, n_hi   = dar_int("xgb_n_est", 50, 1200)
-        d_lo, d_hi   = dar_int("xgb_depth", 1, 9)
-        lr_lo, lr_hi = dar_float("xgb_lr", 0.001, 0.40)
+        n_lo, n_hi     = dar_int("xgb_n_est", 50, 1200)
+        d_lo, d_hi     = dar_int("xgb_depth", 1, 9)
+        lr_lo, lr_hi   = dar_float("xgb_lr", 0.001, 0.40)
         lr_lo = max(0.001, lr_lo * 0.5); lr_hi = min(0.40, lr_hi * 1.5)
         spw_lo, spw_hi = dar_float("xgb_spw", SPW * 0.10, SPW * 8.0)
         params = {
@@ -539,8 +674,8 @@ def faz2_objective(trial):
             "scale_pos_weight" : trial.suggest_float("xgb_spw", max(SPW*0.10, spw_lo*0.7), min(SPW*8.0, spw_hi*1.3)),
         }
     elif algo == "lightgbm":
-        n_lo, n_hi   = dar_int("lgb_n_est", 50, 1200)
-        lr_lo, lr_hi = dar_float("lgb_lr", 0.001, 0.40)
+        n_lo, n_hi     = dar_int("lgb_n_est", 50, 1200)
+        lr_lo, lr_hi   = dar_float("lgb_lr", 0.001, 0.40)
         lr_lo = max(0.001, lr_lo * 0.5); lr_hi = min(0.40, lr_hi * 1.5)
         spw_lo, spw_hi = dar_float("lgb_spw", SPW * 0.10, SPW * 8.0)
         params = {
@@ -558,8 +693,8 @@ def faz2_objective(trial):
             "scale_pos_weight" : trial.suggest_float("lgb_spw", max(SPW*0.10, spw_lo*0.7), min(SPW*8.0, spw_hi*1.3)),
         }
     else:  # catboost
-        n_lo, n_hi   = dar_int("cb_iter", 100, 900)
-        lr_lo, lr_hi = dar_float("cb_lr", 0.001, 0.40)
+        n_lo, n_hi     = dar_int("cb_iter", 100, 900)
+        lr_lo, lr_hi   = dar_float("cb_lr", 0.001, 0.40)
         lr_lo = max(0.001, lr_lo * 0.5); lr_hi = min(0.40, lr_hi * 1.5)
         spw_lo, spw_hi = dar_float("cb_spw", SPW * 0.10, SPW * 8.0)
         params = {
@@ -577,17 +712,22 @@ def faz2_objective(trial):
     rskf = RepeatedStratifiedKFold(n_splits=FAZ2_FOLDS, n_repeats=FAZ2_TEKRAR, random_state=RASTGELE_TOHUM)
     f2_listesi  = []
     auc_listesi = []
-    RAPOR_ADIMI = [FAZ2_FOLDS * FAZ2_TEKRAR // 4, FAZ2_FOLDS * FAZ2_TEKRAR // 2]
+    RAPOR_ADIMI = {FAZ2_FOLDS * FAZ2_TEKRAR // 4, FAZ2_FOLDS * FAZ2_TEKRAR // 2}
 
     for fold_no, (tr_idx, val_idx) in enumerate(rskf.split(X_train, y_train)):
+        # [FIX #1] tr_idx içinde ES ayrımı
+        X_fold_tr, y_fold_tr, X_fold_es, y_fold_es = fold_es_ayir(
+            X_train.iloc[tr_idx], y_train[tr_idx]
+        )
+        # [FIX #8] roc_auc dahil tüm fold hesabı tek try bloğunda
         try:
-            m = model_fit(algo, params, X_train.iloc[tr_idx], y_train[tr_idx], X_train.iloc[val_idx], y_train[val_idx])
+            m    = model_fit(algo, params, X_fold_tr, y_fold_tr, X_fold_es, y_fold_es)
+            prob = m.predict_proba(X_train.iloc[val_idx])[:, 1]
+            _, f2 = en_iyi_f2_esik_grid(y_train[val_idx], prob, adim=0.005)
+            auc   = roc_auc_score(y_train[val_idx], prob)
         except Exception:
             return 0.0
 
-        prob = m.predict_proba(X_train.iloc[val_idx])[:, 1]
-        _, f2 = en_iyi_f2_esik_grid(y_train[val_idx], prob, adim=0.005)
-        auc   = roc_auc_score(y_train[val_idx], prob)
         f2_listesi.append(f2)
         auc_listesi.append(auc)
 
@@ -602,38 +742,75 @@ def faz2_objective(trial):
     return float(np.mean([W_F2 * f + W_AUC * a for f, a in zip(f2_listesi, auc_listesi)]))
 
 
+# [İYİLEŞTİRME] CMA-ES worker sınırlaması
 if len(ALGORITMALAR_FAZ2) == 1:
-    faz2_sampler = optuna.samplers.CmaEsSampler(seed=RASTGELE_TOHUM + 2, n_startup_trials=30, warn_independent_sampling=False)
-    print("  Sampler: CMA-ES (tek algo, dar sürekli uzay)")
+    # CMA-ES: yüksek n_jobs kovaryans matrisini bozar.
+    # n_jobs=6 → makul hız + anlamlı sıralı güncelleme dengesi.
+    FAZ2_PARALEL = min(6, PARALEL_ISCI)
+    faz2_sampler = optuna.samplers.CmaEsSampler(
+        seed=RASTGELE_TOHUM + 2, n_startup_trials=30, warn_independent_sampling=False
+    )
+    print(f"  Sampler: CMA-ES (tek algo)  |  Worker: {FAZ2_PARALEL} [sıralı öğrenme korunuyor]")
 else:
-    faz2_sampler = optuna.samplers.TPESampler(seed=RASTGELE_TOHUM + 1, n_startup_trials=30, multivariate=True, warn_independent_sampling=False)
-    print("  Sampler: TPE multivariate (çoklu algo)")
+    FAZ2_PARALEL = PARALEL_ISCI
+    faz2_sampler = optuna.samplers.TPESampler(
+        seed=RASTGELE_TOHUM + 1, n_startup_trials=30,
+        multivariate=True, warn_independent_sampling=False
+    )
+    print(f"  Sampler: TPE multivariate (çoklu algo)  |  Worker: {FAZ2_PARALEL}")
 
 faz2_study = optuna.create_study(
     study_name="biosense_faz2_v2",
     direction="maximize",
     storage=optuna.storages.RDBStorage(
         url=FAZ2_DB,
-        # Timeout güvencesi 240 saniye!
-        engine_kwargs={"connect_args": {"timeout": 240, "check_same_thread": False}},
+        engine_kwargs={"connect_args": {"timeout": 360, "check_same_thread": False}},  # 240→360
     ),
     load_if_exists=True,
     sampler=faz2_sampler,
     pruner=optuna.pruners.MedianPruner(n_startup_trials=30, n_warmup_steps=8, interval_steps=8),
 )
 
+# 🔥 ŞEBNUS ÖLÜMSÜZ MODU: FAZ 2
 faz2_mevcut = len([t for t in faz2_study.trials if t.state == optuna.trial.TrialState.COMPLETE])
 if faz2_mevcut == 0:
-    for top_t in faz1_top20:
-        try: faz2_study.enqueue_trial(top_t.params)
+    # [FIX #6] Yalnızca FAZ2'nin kullanacağı algoritmaya ait trial'ları sıraya al.
+    # v2.4'te filtre yoktu: FAZ2 XGBoost seçmişse LightGBM seed'leri de sıraya
+    # giriyordu. Objective "xgb_n_est" soruyor ama kuyrukta "lgb_n_est" var →
+    # tüm parametreler rastgele örnekleniyor → CMA-ES warm-start tamamen bozuk.
+    uyumlu_seedler = [t for t in faz1_top20 if get_algo(t) in ALGORITMALAR_FAZ2]
+    for top_t in uyumlu_seedler:
+        try:
+            # Tek algo modunda objective suggest_categorical("algorithm") çağırmaz;
+            # kuyrukta "algorithm" anahtarı kalırsa Optuna "unconsumed param" uyarısı
+            # verir ve o trial başarısız sayılabilir.
+            seed_params = {
+                k: v for k, v in top_t.params.items()
+                if not (len(ALGORITMALAR_FAZ2) == 1 and k == "algorithm")
+            }
+            faz2_study.enqueue_trial(seed_params)
         except Exception: pass
-    print(f"  {len(faz1_top20)} FAZ 1 trial'ı sıraya eklendi.")
+    print(f"  {len(uyumlu_seedler)}/{len(faz1_top20)} FAZ1 trial'ı sıraya eklendi "
+          f"(filtre: {ALGORITMALAR_FAZ2}).")
 
 faz2_kalan = max(0, FAZ2_TRIAL - faz2_mevcut)
 if faz2_kalan > 0:
     print(f"  Mevcut: {faz2_mevcut} | Kalan: {faz2_kalan}")
     t0 = time.perf_counter()
-    faz2_study.optimize(faz2_objective, n_trials=faz2_kalan, n_jobs=PARALEL_ISCI, show_progress_bar=True, catch=(Exception,))
+    while faz2_kalan > 0:
+        try:
+            faz2_study.optimize(faz2_objective, n_trials=faz2_kalan, n_jobs=FAZ2_PARALEL,
+                                show_progress_bar=True, catch=(Exception,))
+            break
+        except Exception as e:
+            if "Cannot tell" in str(e) or "database is locked" in str(e):
+                print(f"\n  [ŞEBNUS KORUMASI] Optuna iç çekirdek çakışması yakalandı: {e}")
+                print("  Kaldığı yerden devam ediyor...")
+                time.sleep(1)
+            else:
+                raise e
+        faz2_mevcut = len([t for t in faz2_study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+        faz2_kalan  = max(0, FAZ2_TRIAL - faz2_mevcut)
     print(f"  FAZ 2 bitti: {time.perf_counter()-t0:.1f}s")
 else:
     print(f"  FAZ 2 zaten tamamlandı ({faz2_mevcut} trial).")
@@ -641,7 +818,8 @@ else:
 faz2_en_iyi = faz2_study.best_value
 print(f"  FAZ 2 En İyi Karma Skor: {faz2_en_iyi:.4f}")
 
-faz2_tamamlanan = [t for t in faz2_study.trials if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None]
+faz2_tamamlanan = [t for t in faz2_study.trials
+                   if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None]
 faz2_sirali = sorted(faz2_tamamlanan, key=lambda t: t.value, reverse=True)
 
 # ══════════════════════════════════════════════════════════════════
@@ -665,6 +843,16 @@ def parametre_mesafe(t1, t2):
     return float(np.sqrt(np.mean(farklar)))
 
 MIN_MESAFE = 0.05
+
+# [FIX] faz2_sirali boşsa (disk dolu, SQLite bozuk gibi nadir durumlarda
+# tüm trial'lar FAILED state'e düşebilir) → [faz2_sirali[0]] IndexError verir.
+# FAZ1 top20 ile fallback yapılıyor; o da boşsa script durdurulur.
+if not faz2_sirali:
+    print("  [UYARI] FAZ 2'de tamamlanan trial bulunamadı! FAZ 1 top20 kullanılıyor.")
+    faz2_sirali = faz1_top20
+if not faz2_sirali:
+    sys.exit("  [HATA] FAZ 1 ve FAZ 2'de hiç tamamlanan trial yok. Script durduruluyor.")
+
 secilen_trials = [faz2_sirali[0]]
 for tc in faz2_sirali[1:]:
     if len(secilen_trials) >= TOP_K_ENSEMBLE: break
@@ -701,9 +889,11 @@ for i, t in enumerate(secilen_trials):
     print(f"  OOF [{i+1:2d}/{len(secilen_trials)}] {algo:<12} CV={t.value:.4f} ...", end="", flush=True)
     t0 = time.perf_counter()
 
-    proba_i = oof_tahmin(algo, model_params, X_train, y_train, OOF_FOLDS, OOF_TEKRAR, n_jobs_override=-1, es_split=OOF_ES_SPLIT)
+    proba_i = oof_tahmin(algo, model_params, X_train, y_train,
+                         OOF_FOLDS, OOF_TEKRAR,
+                         n_jobs_override=-1, es_split=OOF_ES_SPLIT)
     _, f2_i = en_iyi_f2_esik_benzersiz(y_train, proba_i)
-    
+
     model_oof_proba_listesi.append(proba_i)
     model_oof_f2_listesi.append(f2_i)
     print(f" OOF_F2={f2_i:.4f}  {time.perf_counter()-t0:.1f}s")
@@ -728,12 +918,16 @@ print(f"\n  Seçilen ensemble yöntemi: {SECILEN_YONTEM}  (rank={f2_rank:.4f}  w
 print("  Isotonic Regression kalibrasyonu...")
 iso_reg = IsotonicRegression(out_of_bounds="clip")
 iso_reg.fit(ensemble_oof_proba, y_train)
-kalibre_oof_proba       = iso_reg.predict(ensemble_oof_proba)
-OPTIMAL_ESIK, oof_f2    = en_iyi_f2_esik_benzersiz(y_train, kalibre_oof_proba)
+kalibre_oof_proba    = iso_reg.predict(ensemble_oof_proba)
+OPTIMAL_ESIK, oof_f2 = en_iyi_f2_esik_benzersiz(y_train, kalibre_oof_proba)
 
 oof_tahminler = (kalibre_oof_proba >= OPTIMAL_ESIK).astype(int)
 oof_f1        = f1_score(y_train, oof_tahminler, average="weighted", zero_division=0)
-oof_auc       = roc_auc_score(y_train, kalibre_oof_proba)
+# roc_auc_score tüm tahminler sabit olursa (prior fallback senaryosu) ValueError fırlatır
+try:
+    oof_auc = roc_auc_score(y_train, kalibre_oof_proba)
+except ValueError:
+    oof_auc = 0.0
 oof_mcc       = matthews_corrcoef(y_train, oof_tahminler)
 
 print(f"\n  {'─'*56}")
@@ -755,16 +949,32 @@ for i, t in enumerate(secilen_trials):
     algo         = get_algo(t)
     model_params = params_coz(algo, t.params, n_jobs_override=-1)
 
-    X_fin_tr, X_fin_es, y_fin_tr, y_fin_es = train_test_split(
-        X_train, y_train, test_size=max(5, int(N_TRAIN * 0.08)),
-        random_state=RASTGELE_TOHUM + i, stratify=y_train,
-    )
+    # [FIX #7] 388 örneklem + azınlık sınıf → stratify'da sınıf boş kalabilir.
+    # try/except ile stratify başarısız olursa stratify'sız devam edilir.
+    es_size = max(5, int(N_TRAIN * 0.08))
+    try:
+        X_fin_tr, X_fin_es, y_fin_tr, y_fin_es = train_test_split(
+            X_train, y_train, test_size=es_size,
+            random_state=RASTGELE_TOHUM + i, stratify=y_train,
+        )
+    except ValueError:
+        X_fin_tr, X_fin_es, y_fin_tr, y_fin_es = train_test_split(
+            X_train, y_train, test_size=es_size,
+            random_state=RASTGELE_TOHUM + i,
+        )
 
     print(f"  Final [{i+1:2d}/{len(secilen_trials)}] {algo:<12} ...", end="", flush=True)
     t0 = time.perf_counter()
 
-    fm = model_fit(algo, model_params, X_fin_tr, y_fin_tr, X_fin_es, y_fin_es)
-    final_test_proba_listesi.append(fm.predict_proba(X_test)[:, 1])
+    # [FIX] model_fit başarısız olursa crash yerine prior tahmini kullan.
+    # Liste uzunluğu korunuyor → agirliklar ile indeks uyumu bozulmuyor.
+    try:
+        fm         = model_fit(algo, model_params, X_fin_tr, y_fin_tr, X_fin_es, y_fin_es)
+        test_proba = fm.predict_proba(X_test)[:, 1]
+    except Exception as e:
+        print(f"\n    [UYARI] Final model başarısız ({e}), prior kullanılıyor.")
+        test_proba = np.full(N_TEST, float(y_train.mean()))
+    final_test_proba_listesi.append(test_proba)
 
     print(f" {time.perf_counter()-t0:.2f}s")
     gc.collect()
@@ -779,7 +989,10 @@ final_test_proba = iso_reg.predict(final_raw)
 test_tahminler = (final_test_proba >= OPTIMAL_ESIK).astype(int)
 test_f2        = fbeta_score(y_test, test_tahminler, beta=2, average="weighted", zero_division=0)
 test_f1        = f1_score(y_test, test_tahminler, average="weighted", zero_division=0)
-test_auc       = roc_auc_score(y_test, final_test_proba)
+try:
+    test_auc = roc_auc_score(y_test, final_test_proba)
+except ValueError:
+    test_auc = 0.0
 test_mcc       = matthews_corrcoef(y_test, test_tahminler)
 test_acc       = accuracy_score(y_test, test_tahminler)
 cm             = confusion_matrix(y_test, test_tahminler)
@@ -813,20 +1026,24 @@ print(f"  FAZ 2 skor   : {faz2_en_iyi:.4f}")
 print(f"  OOF↔Test     : {test_f2 - oof_f2:+.4f}")
 print("=" * 72)
 
-# ── TEKNOFEST JÜRİ RAPORU (Her Algoritmanın Zirvesi) ──────────────
+# ── TEKNOFEST JÜRİ RAPORU ─────────────────────────────────────────
 juri_karsilastirma = {}
 tum_triallar = faz1_study.trials + faz2_study.trials
 for algo in ALGORITMALAR:
-    a_trials = [t for t in tum_triallar if t.state == optuna.trial.TrialState.COMPLETE and get_algo(t) == algo and t.value is not None]
+    a_trials = [t for t in tum_triallar
+                if t.state == optuna.trial.TrialState.COMPLETE
+                and get_algo(t) == algo and t.value is not None]
     if a_trials:
-        best_a = max(a_trials, key=lambda t: t.value)
+        best_a      = max(a_trials, key=lambda t: t.value)
         temiz_params = params_coz(algo, best_a.params)
-        for k in ["n_jobs", "thread_count", "verbosity", "verbose", "random_state", "random_seed", "device", "enable_categorical", "tree_method"]:
+        for k in ["n_jobs", "thread_count", "verbosity", "verbose", "random_state",
+                  "random_seed", "device", "enable_categorical", "tree_method"]:
             temiz_params.pop(k, None)
-        
+
         juri_karsilastirma[algo] = {
             "en_iyi_cv_skor": float(round(best_a.value, 4)),
-            "parametreler": {k: (float(round(v, 6)) if isinstance(v, float) else v) for k, v in temiz_params.items()}
+            "parametreler": {k: (float(round(v, 6)) if isinstance(v, float) else v)
+                             for k, v in temiz_params.items()}
         }
 
 print("\n" + "=" * 72)
@@ -836,7 +1053,6 @@ for algo, data in juri_karsilastirma.items():
     print(f"  🏆 {algo.upper():<10} -> Max CV Skoru: {data['en_iyi_cv_skor']:.4f}")
 
 # ── JSON Kayıt ────────────────────────────────────────────────────
-# 🔥 ŞEBNUS GÜVENLİK DOKUNUŞU: Tüm metrikler saf Python Float'ına çevrildi (JSON Hatası %0)
 best_trial  = secilen_trials[0]
 best_algo   = get_algo(best_trial)
 best_params = params_coz(best_algo, best_trial.params)
@@ -845,8 +1061,21 @@ best_params.pop("thread_count", None)
 
 sonuc = {
     "_aciklama": {
-        "surum"          : "BioSense AI v2.2 (GECE MODU)",
-        "duzeltmeler"    : ["CMA-ES Kategorik Bug Fix", "SQLite Timeout 240s", "JSON Float32 Casting"],
+        "surum" : "BioSense AI v2.8 (FIX #1-#20)",
+        "duzeltmeler"    : [
+            "FIX#1:  ES sızıntısı (fold_es_ayir)",
+            "FIX#2:  SHAP FAZ1 öncesine taşındı",
+            "FIX#4:  Galip algo top-50 ort",
+            "FIX#5:  Stratify crash koruması",
+            "FIX#6:  FAZ2 seed algo filtresi",
+            "FIX#7:  [7/7] final split stratify koruması",
+            "FIX#8:  roc_auc try/except kapsamı genişletildi",
+            "FIX#9:  aralik_hesapla algo-filtreli top20",
+            "FIX#10: oof_tahmin model_fit crash koruması",
+            "FIX#11: Display sıralaması top-50 ort ile tutarlı",
+            "FIX#12: faz2_sirali boş IndexError koruması",
+            "İYİ:   CMA-ES worker sınırı | SQLite 360s",
+        ],
         "algoritmalar"   : ALGORITMALAR_FAZ2,
         "ensemble_k"     : len(secilen_trials),
         "ensemble_yontem": SECILEN_YONTEM,
@@ -857,8 +1086,8 @@ sonuc = {
         "algorithm"    : best_algo,
         **{k: (float(round(v, 6)) if isinstance(v, float) else v)
            for k, v in best_params.items()
-           if k not in ("n_jobs", "thread_count", "verbosity", "verbose", 
-                        "random_state", "random_seed", "enable_categorical", 
+           if k not in ("n_jobs", "thread_count", "verbosity", "verbose",
+                        "random_state", "random_seed", "enable_categorical",
                         "tree_method", "device")},
         "OPTIMAL_ESIK" : float(OPTIMAL_ESIK),
     },
@@ -909,5 +1138,5 @@ with open(CIKTI_JSON, "w", encoding="utf-8") as f:
 print(f"\n  '{CIKTI_JSON}' kaydedildi.")
 print("  PDR v7 için → OPTUNA_MODU=False  OPTUNA_JSON='en_iyi_parametreler_v2.json'")
 print("\n" + "=" * 72)
-print("  BioSense AI v2.2 — TAMAMLANDI")
+print("  BioSense AI v2.8 — TAMAMLANDI")
 print("=" * 72)
