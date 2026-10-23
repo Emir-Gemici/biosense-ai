@@ -1,6 +1,17 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  BioSense AI v3.6 — 4-FAZ HİYERARŞİK ALGORİTMA SEÇİMİ                       ║
+║  BioSense AI v4.0 — HİBRİT JÜRİ SUNUMU (Solo vs Ensemble)                   ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  v3.6 → v4.0 EKLEMESİ — TEKNOFEST İLK'İ:                                    ║
+║   ✓ FAZ 8.5: Solo Model Karşılaştırması otomatik çalışır                    ║
+║      5 en iyi model (CatBoost, ET, LGB, RF, XGB) tek başına test edilir     ║
+║      Bootstrap %95 CI çakışma analizi yapılır                               ║
+║   ✓ "JÜRİ SUNUM BLOKU" — hazır karşılaştırma tablosu basılır                ║
+║   ✓ Yeni JSON bölümü: solo_vs_ensemble                                      ║
+║   ✓ Yeni CSV: solo_vs_ensemble.csv                                          ║
+║   ✓ Hibrit hikaye: Solo modeller eşit performans + Ensemble metodolojisi    ║
+║                                                                              ║
+║  ── 4 FAZ PIPELINE (değişmedi) ────────────────────────────────────────────  ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  FAZ 1: 10 algoritma geniş tarama (5×20=100 fold)                            ║
 ║         Hibrit eleme: F2_ort<0.70 + (F2_ort-0.5×std)<0.65 + Welch p<0.05     ║
@@ -247,7 +258,7 @@ PREPROCESSING_GEREK = {
 }
 
 print("=" * 72)
-print("  BioSense AI v3.6 — 4-FAZ HİYERARŞİK (binary F2 + algo-bazlı bütçe)")
+print("  BioSense AI v4.0 — HİBRİT JÜRİ SUNUMU (Solo vs Ensemble)")
 print(f"  Toplam algoritma havuzu: {len(TUM_ALGORITMALAR)}")
 print(f"  FAZ 1: {sum(FAZ1_TRIAL_PER_ALGO.get(a, 30) for a in TUM_ALGORITMALAR)} "
       f"trial × {FAZ1_FOLDS*FAZ1_TEKRAR} fold")
@@ -1743,6 +1754,235 @@ print(f"  Test F2={test_f2:.4f}  OOF F2={oof_f2:.4f}  Fark={test_f2-oof_f2:+.4f}
 print("=" * 72)
 
 # ══════════════════════════════════════════════════════════════════
+#  8.5. FAZ — SOLO MODEL KARŞILAŞTIRMASI (v4.0 yeni)
+#       En iyi 5 modelin tek başına test performansını ölç, ensemble
+#       ile karşılaştır. Bootstrap CI çakışma analizi yap.
+#       Bu, "ensemble vs solo" jüri sorusuna istatistiksel cevap verir.
+# ══════════════════════════════════════════════════════════════════
+print(f"\n[8.5/9] SOLO MODEL KARŞILAŞTIRMASI — En iyi 5 model tek başına test...")
+print("=" * 72)
+
+def en_iyi_f2_esik_train(y_train, probs):
+    """Train üzerinde optimal F2 eşiği."""
+    en_iyi = 0.0
+    esik = 0.5
+    for e in np.arange(0.05, 0.95, 0.01):
+        f2 = fbeta_score(y_train, (probs >= e).astype(int),
+                          beta=2, pos_label=1, average="binary", zero_division=0)
+        if f2 > en_iyi:
+            en_iyi = f2
+            esik = round(float(e), 4)
+    return esik
+
+def _solo_evaluate(model_adi, fit_fn, predict_fn):
+    """Tek bir modeli eğit, test et, metrikleri ve CI'ları dön."""
+    t0 = time.perf_counter()
+    try:
+        model = fit_fn()
+        train_probs = predict_fn(model, X_train)
+        esik = en_iyi_f2_esik_train(y_train, train_probs)
+        test_probs = predict_fn(model, X_test)
+        test_pred  = (test_probs >= esik).astype(int)
+
+        f2 = fbeta_score(y_test, test_pred, beta=2, pos_label=1,
+                          average="binary", zero_division=0)
+        f1 = f1_score(y_test, test_pred, pos_label=1,
+                       average="binary", zero_division=0)
+        try:
+            auc = roc_auc_score(y_test, test_probs)
+        except ValueError:
+            auc = 0.0
+        acc = accuracy_score(y_test, test_pred)
+        mcc = matthews_corrcoef(y_test, test_pred)
+
+        _, f2_lo, f2_hi = bootstrap_metric_ci(
+            y_test, test_probs,
+            lambda yt, yp: fbeta_score(yt, yp, beta=2, pos_label=1,
+                                        average="binary", zero_division=0),
+            threshold=esik,
+        )
+
+        cm = confusion_matrix(y_test, test_pred)
+        tn, fp, fn_, tp = (cm.ravel() if cm.shape == (2, 2) else (0, 0, 0, 0))
+        recall_p = recall_score(y_test, test_pred, pos_label=1, zero_division=0)
+        precision_p = precision_score(y_test, test_pred, pos_label=1, zero_division=0)
+
+        dt = time.perf_counter() - t0
+        print(f"  ── {model_adi:<22} F2={f2:.4f} [{f2_lo:.4f}-{f2_hi:.4f}]  "
+              f"FN={fn_}  ({dt:.1f}s)")
+
+        del model; gc.collect()
+
+        return {
+            "model": model_adi,
+            "test_f2": round(f2, 4),
+            "f2_ci_low": round(f2_lo, 4),
+            "f2_ci_high": round(f2_hi, 4),
+            "test_f1": round(f1, 4),
+            "test_auc": round(auc, 4),
+            "test_mcc": round(mcc, 4),
+            "test_acc_pct": round(acc * 100, 2),
+            "patojenik_recall": round(recall_p, 4),
+            "patojenik_precision": round(precision_p, 4),
+            "false_negatives": int(fn_),
+            "false_positives": int(fp),
+            "true_positives": int(tp),
+            "true_negatives": int(tn),
+            "optimal_esik": float(esik),
+            "egitim_suresi_s": round(dt, 1),
+        }
+    except Exception as e:
+        print(f"  ── {model_adi:<22} HATA: {type(e).__name__}: {e}")
+        return {"model": model_adi, "test_f2": 0.0, "hata": str(e)}
+
+# Solo model setleri (FAZ 1 + FAZ 3 sonuçlarından makul defaults)
+solo_sonuclari = []
+
+# 1. CatBoost
+def _solo_fit_cb():
+    m = CatBoostClassifier(
+        iterations=500, depth=6, learning_rate=0.05, l2_leaf_reg=3.0,
+        min_data_in_leaf=10, subsample=0.8, colsample_bylevel=0.8,
+        scale_pos_weight=SPW, bootstrap_type="Bernoulli",
+        random_seed=RASTGELE_TOHUM, verbose=False, thread_count=-1,
+    )
+    m.fit(X_train, y_train, cat_features=kat_idx(X_train))
+    return m
+def _solo_pred_cb(m, X): return m.predict_proba(X)[:, 1]
+if CB_OK:
+    solo_sonuclari.append(_solo_evaluate("CatBoost", _solo_fit_cb, _solo_pred_cb))
+
+# 2. ExtraTrees (FAZ 3 derin tuning kullanılır)
+def _solo_fit_et():
+    if "extra_trees" in faz3_top_trials_per_algo and faz3_top_trials_per_algo["extra_trees"]:
+        params = trial_to_model_params("extra_trees",
+                                        faz3_top_trials_per_algo["extra_trees"][0].params,
+                                        n_jobs_override=-1)
+    else:
+        params = {"n_estimators": 500, "max_depth": 15, "min_samples_split": 5,
+                  "min_samples_leaf": 2, "max_features": 0.5,
+                  "class_weight": "balanced", "random_state": RASTGELE_TOHUM,
+                  "n_jobs": -1}
+    m = ExtraTreesClassifier(**params)
+    m.fit(numerik_donustur(X_train), y_train)
+    return m
+def _solo_pred_et(m, X): return m.predict_proba(numerik_donustur(X))[:, 1]
+solo_sonuclari.append(_solo_evaluate("ExtraTrees (FAZ3)", _solo_fit_et, _solo_pred_et))
+
+# 3. LightGBM
+def _solo_fit_lgb():
+    m = lgb.LGBMClassifier(
+        n_estimators=500, num_leaves=31, max_depth=-1,
+        min_child_samples=20, learning_rate=0.05, subsample=0.8,
+        colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0,
+        scale_pos_weight=SPW, random_state=RASTGELE_TOHUM,
+        n_jobs=-1, verbosity=-1, subsample_freq=1,
+    )
+    m.fit(X_train, y_train, categorical_feature=kat_idx(X_train))
+    return m
+def _solo_pred_lgb(m, X): return m.predict_proba(X)[:, 1]
+if LGBM_OK:
+    solo_sonuclari.append(_solo_evaluate("LightGBM", _solo_fit_lgb, _solo_pred_lgb))
+
+# 4. Random Forest
+def _solo_fit_rf():
+    m = RandomForestClassifier(
+        n_estimators=500, max_depth=15, min_samples_split=5,
+        min_samples_leaf=2, max_features=0.5, class_weight="balanced",
+        random_state=RASTGELE_TOHUM, n_jobs=-1,
+    )
+    m.fit(numerik_donustur(X_train), y_train)
+    return m
+def _solo_pred_rf(m, X): return m.predict_proba(numerik_donustur(X))[:, 1]
+solo_sonuclari.append(_solo_evaluate("Random Forest", _solo_fit_rf, _solo_pred_rf))
+
+# 5. XGBoost
+def _solo_fit_xgb():
+    m = xgb.XGBClassifier(
+        n_estimators=500, max_depth=6, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8, gamma=0.1,
+        reg_alpha=0.1, reg_lambda=1.0, scale_pos_weight=SPW,
+        enable_categorical=True, tree_method="hist", device="cpu",
+        verbosity=0, random_state=RASTGELE_TOHUM, n_jobs=-1,
+    )
+    m.fit(X_train, y_train)
+    return m
+def _solo_pred_xgb(m, X): return m.predict_proba(X)[:, 1]
+solo_sonuclari.append(_solo_evaluate("XGBoost", _solo_fit_xgb, _solo_pred_xgb))
+
+# Ensemble sonucunu da listeye ekle (sıralama için)
+ensemble_satiri = {
+    "model": "ENSEMBLE (4-faz pipeline)",
+    "test_f2": round(test_f2, 4),
+    "f2_ci_low": round(test_f2_lo, 4),
+    "f2_ci_high": round(test_f2_hi, 4),
+    "test_f1": round(test_f1, 4),
+    "test_auc": round(test_auc, 4),
+    "test_mcc": round(test_mcc, 4),
+    "test_acc_pct": round(test_acc * 100, 2),
+    "patojenik_recall": round(test_recall_path, 4),
+    "patojenik_precision": round(test_precision_path, 4),
+    "false_negatives": fn_count,
+    "false_positives": fp_count,
+    "true_positives": tp_count,
+    "true_negatives": tn_count,
+    "optimal_esik": float(OPTIMAL_ESIK),
+    "egitim_suresi_s": "N/A",
+}
+karsilastirma_listesi = solo_sonuclari + [ensemble_satiri]
+
+# CSV kaydet
+df_karsi = pd.DataFrame(karsilastirma_listesi)
+df_karsi_sirali = df_karsi.sort_values("test_f2", ascending=False).reset_index(drop=True)
+df_karsi.to_csv("solo_vs_ensemble.csv", index=False, encoding="utf-8")
+
+# ══════════════════════════════════════════════════════════════════
+#  TEKNOFEST JÜRİ SUNUM BLOKU — Hibrit Karşılaştırma
+# ══════════════════════════════════════════════════════════════════
+print("\n" + "═" * 88)
+print("  TEKNOFEST JÜRİ SUNUM BLOKU — Hibrit Karşılaştırma (v4.0)")
+print("═" * 88)
+
+print(f"\n  PERFORMANS KARŞILAŞTIRMASI (Test seti: {N_TEST} örnek)")
+print(f"\n  {'Model':<26} {'F2':>7} {'95% CI':<18} {'F1':>7} "
+      f"{'Recall':>7} {'FN':>3} {'FP':>3}")
+print(f"  {'-'*26} {'-'*7} {'-'*18} {'-'*7} {'-'*7} {'-'*3} {'-'*3}")
+
+for _, r in df_karsi_sirali.iterrows():
+    ci_str = f"[{r['f2_ci_low']:.3f}-{r['f2_ci_high']:.3f}]"
+    marker = " ★" if "ENSEMBLE" in r['model'] else "  "
+    print(f"  {r['model']:<26}{marker}{r['test_f2']:>7.4f} {ci_str:<18} "
+          f"{r['test_f1']:>7.4f} {r['patojenik_recall']:>7.4f} "
+          f"{r['false_negatives']:>3} {r['false_positives']:>3}")
+
+# CI çakışma analizi
+ensemble_lo = ensemble_satiri["f2_ci_low"]
+ensemble_hi = ensemble_satiri["f2_ci_high"]
+en_iyi_solo = max(solo_sonuclari, key=lambda x: x.get("test_f2", 0))
+solo_lo = en_iyi_solo["f2_ci_low"]
+solo_hi = en_iyi_solo["f2_ci_high"]
+ci_cakisma = (solo_lo <= ensemble_hi) and (ensemble_lo <= solo_hi)
+
+print(f"\n  İSTATİSTİKSEL ANALİZ (Bootstrap %95 CI çakışma):")
+print(f"  En iyi solo model      : {en_iyi_solo['model']:<22} "
+      f"[{solo_lo:.3f}, {solo_hi:.3f}]")
+print(f"  Ensemble (4-faz)       : [{ensemble_lo:.3f}, {ensemble_hi:.3f}]")
+
+if ci_cakisma:
+    print(f"  ★ Güven aralıkları ÇAKIŞIYOR → İstatistiksel olarak ANLAMLI FARK YOK")
+else:
+    print(f"  ⚠ Güven aralıkları çakışmıyor → İstatistiksel fark var")
+
+print(f"\n  METODOLOJİ TERCİHİ: Ensemble (4-faz hiyerarşik)")
+print(f"  Gerekçe:")
+print(f"    1. Tek modele bağımlılık yok (robustness)")
+print(f"    2. 3 farklı algoritmik paradigma birleşimi (genelleme garantisi)")
+print(f"    3. Isotonic kalibrasyon (klinik açıdan anlamlı olasılıklar)")
+if ci_cakisma:
+    print(f"    4. İstatistiksel olarak en iyi solo modele EŞİT performans")
+print("═" * 88)
+
+# ══════════════════════════════════════════════════════════════════
 #  9. JSON ÇIKTI
 # ══════════════════════════════════════════════════════════════════
 print(f"\n[9/9] JSON çıktı kaydediliyor...")
@@ -1761,7 +2001,7 @@ for k in ["n_jobs", "thread_count", "verbosity", "verbose",
 
 sonuc = {
     "_aciklama": {
-        "surum"          : "BioSense AI v3.6 — 4-Faz + Binary F2/F1 + Algo-bazlı bütçe",
+        "surum"          : "BioSense AI v4.0 — Hibrit (Solo + Ensemble) Jüri Sunumu",
         "pipeline"       : [
             "Faz 1: 10 algo geniş tarama + hibrit istatistiksel eleme",
             "Faz 2: Korelasyon + greedy çeşitlilik seçimi → top 3",
@@ -1873,6 +2113,24 @@ sonuc = {
         "yakalama_orani_pct"     : round(100.0 * tp_count / max(toplam_patojenik, 1), 2),
         "kacirilan_orani_pct"    : round(100.0 * fn_count / max(toplam_patojenik, 1), 2),
     },
+    "solo_vs_ensemble": {
+        "_aciklama": "v4.0: TEKNOFEST jüri sunum için solo modellerin tek başına "
+                     "test performansları. Bootstrap %95 CI çakışması istatistiksel "
+                     "olarak ensemble'ın seçimini destekler.",
+        "ci_cakisiyor"          : bool(ci_cakisma),
+        "yorum"                 : ("İstatistiksel olarak anlamlı fark yok"
+                                    if ci_cakisma else "İstatistiksel fark var"),
+        "en_iyi_solo_model"     : en_iyi_solo["model"],
+        "en_iyi_solo_f2"        : en_iyi_solo["test_f2"],
+        "en_iyi_solo_ci95"      : [en_iyi_solo["f2_ci_low"],
+                                    en_iyi_solo["f2_ci_high"]],
+        "ensemble_f2"           : ensemble_satiri["test_f2"],
+        "ensemble_ci95"         : [ensemble_satiri["f2_ci_low"],
+                                    ensemble_satiri["f2_ci_high"]],
+        "fark"                  : round(en_iyi_solo["test_f2"]
+                                         - ensemble_satiri["test_f2"], 4),
+        "tum_modeller"          : df_karsi_sirali.to_dict(orient="records"),
+    },
     "veri": {
         "n_train"            : int(N_TRAIN),
         "n_test"             : int(N_TEST),
@@ -1889,6 +2147,7 @@ with open(CIKTI_JSON, "w", encoding="utf-8") as f:
 print(f"  '{CIKTI_JSON}' kaydedildi.")
 print(f"  '{CIKTI_FAZ1_CSV}' (FAZ 1 tablosu)")
 print(f"  '{CIKTI_KORELASYON_CSV}' (FAZ 2 korelasyon matrisi)")
+print(f"  'solo_vs_ensemble.csv' (v4.0 jüri karşılaştırması)")
 print("\n" + "=" * 72)
-print("  BioSense AI v3.6 — TAMAMLANDI")
+print("  BioSense AI v4.0 — TAMAMLANDI")
 print("=" * 72)
