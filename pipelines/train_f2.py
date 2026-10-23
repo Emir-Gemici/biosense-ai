@@ -1,15 +1,19 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  BioSense AI v4.0 — HİBRİT JÜRİ SUNUMU (Solo vs Ensemble)                   ║
+║  BioSense AI v4.1 — TEKNOFEST RAPORU İÇİN TAM PIPELINE                      ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  v3.6 → v4.0 EKLEMESİ — TEKNOFEST İLK'İ:                                    ║
-║   ✓ FAZ 8.5: Solo Model Karşılaştırması otomatik çalışır                    ║
-║      5 en iyi model (CatBoost, ET, LGB, RF, XGB) tek başına test edilir     ║
-║      Bootstrap %95 CI çakışma analizi yapılır                               ║
-║   ✓ "JÜRİ SUNUM BLOKU" — hazır karşılaştırma tablosu basılır                ║
-║   ✓ Yeni JSON bölümü: solo_vs_ensemble                                      ║
-║   ✓ Yeni CSV: solo_vs_ensemble.csv                                          ║
-║   ✓ Hibrit hikaye: Solo modeller eşit performans + Ensemble metodolojisi    ║
+║  v4.0 → v4.1 EKLEMESİ — TEKNOFEST ŞARTNAMESİ TAM UYUMU:                     ║
+║   ✓ PR-AUC (average_precision_score) eklendi — ZORUNLU metrik               ║
+║      Hem OOF hem test için bootstrap %95 CI ile                             ║
+║   ✓ Karar eşiği tablosu — 13 farklı eşikte (0.10-0.70) tüm metrikler        ║
+║      "Farklı karar eşiklerinin test sonuçları" şartı karşılandı             ║
+║   ✓ 8 adet PNG görsel otomatik üretilir (grafikler/ klasörü):              ║
+║      - SHAP top 15 özellik (açıklanabilirlik)                              ║
+║      - FAZ 1 algoritma karşılaştırma bar chart                             ║
+║      - FAZ 2 korelasyon heatmap                                             ║
+║      - Confusion matrix (ensemble + top 3 solo, klinik etiketli)           ║
+║      - Solo vs Ensemble F2 bar (CI'lı)                                      ║
+║      - ROC + Precision-Recall eğri karşılaştırması                          ║
 ║                                                                              ║
 ║  ── 4 FAZ PIPELINE (değişmedi) ────────────────────────────────────────────  ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
@@ -105,7 +109,18 @@ from sklearn.metrics import (
     fbeta_score, f1_score, roc_auc_score,
     accuracy_score, matthews_corrcoef, confusion_matrix,
     precision_score, recall_score,
+    average_precision_score, precision_recall_curve, roc_curve,
 )
+
+# v4.1: Görsel üretimi için matplotlib
+try:
+    import matplotlib
+    matplotlib.use("Agg")  # headless mode (Windows server / SSH)
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_OK = True
+except ImportError:
+    MATPLOTLIB_OK = False
+    print("[UYARI] matplotlib yok → pip install matplotlib (görseller atlanır)")
 from scipy.stats import rankdata, ttest_ind
 
 try:
@@ -258,7 +273,7 @@ PREPROCESSING_GEREK = {
 }
 
 print("=" * 72)
-print("  BioSense AI v4.0 — HİBRİT JÜRİ SUNUMU (Solo vs Ensemble)")
+print("  BioSense AI v4.1 — TEKNOFEST RAPORU İÇİN TAM PIPELINE")
 print(f"  Toplam algoritma havuzu: {len(TUM_ALGORITMALAR)}")
 print(f"  FAZ 1: {sum(FAZ1_TRIAL_PER_ALGO.get(a, 30) for a in TUM_ALGORITMALAR)} "
       f"trial × {FAZ1_FOLDS*FAZ1_TEKRAR} fold")
@@ -417,6 +432,269 @@ def bootstrap_metric_ci(y_true, y_proba_or_pred, metric_func, n_boot=2000,
 def rank_ensemble(proba_listesi):
     ranked = [rankdata(p) / len(p) for p in proba_listesi]
     return np.mean(ranked, axis=0)
+
+# ══════════════════════════════════════════════════════════════════
+#  v4.1: GÖRSEL ÜRETİM FONKSİYONLARI (TEKNOFEST raporu için)
+# ══════════════════════════════════════════════════════════════════
+
+GRAFIK_KLASOR = "grafikler"
+if MATPLOTLIB_OK and not os.path.exists(GRAFIK_KLASOR):
+    os.makedirs(GRAFIK_KLASOR)
+
+def confusion_matrix_gorseli(y_true, y_pred, ad, dosya_adi):
+    """
+    Confusion matrix'i PNG olarak kaydet (klinik anlamla).
+    TEKNOFEST raporunda her model için bu görsel zorunlu.
+    """
+    if not MATPLOTLIB_OK:
+        return
+    cm = confusion_matrix(y_true, y_pred)
+    if cm.shape != (2, 2):
+        return
+    tn, fp, fn, tp = cm.ravel()
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    im = ax.imshow(cm, cmap="Blues", aspect="auto")
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    # Hücre değerleri ve klinik etiketler
+    etiketler = [
+        [f"{tn}\nGerçek Negatif\n(Doğru Benign)",
+         f"{fp}\nYanlış Pozitif\n(Gereksiz takip)"],
+        [f"{fn}\nYanlış Negatif\n(KAÇIRILAN PATOJENİK)",
+         f"{tp}\nGerçek Pozitif\n(Doğru Patojenik)"],
+    ]
+    for i in range(2):
+        for j in range(2):
+            renk = "white" if cm[i, j] > cm.max() / 2 else "black"
+            ax.text(j, i, etiketler[i][j], ha="center", va="center",
+                    color=renk, fontsize=10, fontweight="bold")
+
+    ax.set_xticks([0, 1])
+    ax.set_yticks([0, 1])
+    ax.set_xticklabels(["Tahmin: Benign (0)", "Tahmin: Patojenik (1)"])
+    ax.set_yticklabels(["Gerçek: Benign (0)", "Gerçek: Patojenik (1)"])
+    ax.set_title(f"{ad}\nKarmaşıklık Matrisi", fontsize=12, fontweight="bold")
+    plt.tight_layout()
+    yol = os.path.join(GRAFIK_KLASOR, dosya_adi)
+    plt.savefig(yol, dpi=150, bbox_inches="tight")
+    plt.close()
+
+def faz1_karsilastirma_bar(faz1_data, dosya_adi="faz1_algoritma_karsilastirma.png"):
+    """
+    FAZ 1'in 10 algoritmasının F2/F1/MCC karşılaştırma bar chart'ı.
+    """
+    if not MATPLOTLIB_OK:
+        return
+    sirali = sorted(faz1_data, key=lambda x: x["mean_f2"], reverse=True)
+    algos = [r["algo"] for r in sirali]
+    f2s   = [r["mean_f2"] for r in sirali]
+    f1s   = [r.get("mean_f1", 0) for r in sirali]
+    stds  = [r["std_f2"] for r in sirali]
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    x = np.arange(len(algos))
+    genislik = 0.35
+
+    bar1 = ax.bar(x - genislik/2, f2s, genislik, label="F2 (binary)",
+                   yerr=stds, capsize=4, color="#1f77b4", edgecolor="black")
+    bar2 = ax.bar(x + genislik/2, f1s, genislik, label="F1 (binary)",
+                   color="#ff7f0e", edgecolor="black")
+
+    ax.set_xlabel("Algoritma", fontsize=11, fontweight="bold")
+    ax.set_ylabel("Skor", fontsize=11, fontweight="bold")
+    ax.set_title("FAZ 1 — 10 Algoritma Karşılaştırması (Binary F2 ve F1, ±std)",
+                  fontsize=13, fontweight="bold")
+    ax.set_xticks(x)
+    ax.set_xticklabels(algos, rotation=35, ha="right")
+    ax.legend(loc="lower left")
+    ax.grid(axis="y", linestyle="--", alpha=0.6)
+    ax.set_ylim([0, 1.05])
+
+    # Eleme çizgisi
+    ax.axhline(y=0.70, color="red", linestyle=":", linewidth=1.5,
+                label="Eleme eşiği (F2=0.70)")
+    plt.tight_layout()
+    yol = os.path.join(GRAFIK_KLASOR, dosya_adi)
+    plt.savefig(yol, dpi=150, bbox_inches="tight")
+    plt.close()
+
+def korelasyon_heatmap(korelasyon_df, dosya_adi="faz2_korelasyon_heatmap.png"):
+    """FAZ 2 korelasyon matrisi heatmap'i."""
+    if not MATPLOTLIB_OK:
+        return
+    fig, ax = plt.subplots(figsize=(10, 8))
+    im = ax.imshow(korelasyon_df.values, cmap="RdYlGn_r", vmin=0.5, vmax=1.0, aspect="auto")
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Korelasyon")
+
+    cols = list(korelasyon_df.columns)
+    ax.set_xticks(range(len(cols)))
+    ax.set_yticks(range(len(cols)))
+    ax.set_xticklabels(cols, rotation=45, ha="right")
+    ax.set_yticklabels(cols)
+
+    # Sayıları yaz
+    for i in range(len(cols)):
+        for j in range(len(cols)):
+            val = korelasyon_df.iloc[i, j]
+            renk = "white" if val < 0.7 or val > 0.95 else "black"
+            ax.text(j, i, f"{val:.2f}", ha="center", va="center",
+                     color=renk, fontsize=9)
+
+    ax.set_title("FAZ 2 — Algoritma OOF Tahminleri Arası Korelasyon\n"
+                  "(Düşük korelasyon = Yüksek Çeşitlilik)",
+                  fontsize=12, fontweight="bold")
+    plt.tight_layout()
+    yol = os.path.join(GRAFIK_KLASOR, dosya_adi)
+    plt.savefig(yol, dpi=150, bbox_inches="tight")
+    plt.close()
+
+def roc_pr_curve_karsilastirma(y_true, proba_dict, dosya_adi="roc_pr_curves.png"):
+    """
+    ROC + Precision-Recall Curve karşılaştırması (çoklu model).
+    proba_dict: {model_adi: olasilik_dizisi}
+    """
+    if not MATPLOTLIB_OK:
+        return
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    renkler = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
+
+    for i, (ad, proba) in enumerate(proba_dict.items()):
+        c = renkler[i % len(renkler)]
+        # ROC
+        try:
+            fpr, tpr, _ = roc_curve(y_true, proba)
+            auc_v = roc_auc_score(y_true, proba)
+            ax1.plot(fpr, tpr, color=c, lw=2,
+                      label=f"{ad} (AUC={auc_v:.3f})")
+        except Exception:
+            pass
+        # PR
+        try:
+            prec, rec, _ = precision_recall_curve(y_true, proba)
+            ap = average_precision_score(y_true, proba)
+            ax2.plot(rec, prec, color=c, lw=2,
+                      label=f"{ad} (PR-AUC={ap:.3f})")
+        except Exception:
+            pass
+
+    ax1.plot([0, 1], [0, 1], "k--", lw=1, alpha=0.5)
+    ax1.set_xlabel("False Positive Rate", fontsize=11)
+    ax1.set_ylabel("True Positive Rate", fontsize=11)
+    ax1.set_title("ROC Eğrisi Karşılaştırması", fontsize=12, fontweight="bold")
+    ax1.legend(loc="lower right", fontsize=9)
+    ax1.grid(linestyle="--", alpha=0.6)
+    ax1.set_xlim([0, 1]); ax1.set_ylim([0, 1.02])
+
+    baseline = float((y_true == 1).mean())
+    ax2.axhline(y=baseline, color="k", linestyle="--", lw=1, alpha=0.5,
+                 label=f"Baz (sınıf %{baseline*100:.0f})")
+    ax2.set_xlabel("Recall (Duyarlılık)", fontsize=11)
+    ax2.set_ylabel("Precision (Kesinlik)", fontsize=11)
+    ax2.set_title("Precision-Recall Eğrisi Karşılaştırması",
+                   fontsize=12, fontweight="bold")
+    ax2.legend(loc="lower left", fontsize=9)
+    ax2.grid(linestyle="--", alpha=0.6)
+    ax2.set_xlim([0, 1]); ax2.set_ylim([0, 1.02])
+
+    plt.tight_layout()
+    yol = os.path.join(GRAFIK_KLASOR, dosya_adi)
+    plt.savefig(yol, dpi=150, bbox_inches="tight")
+    plt.close()
+
+def solo_vs_ensemble_bar(karsilastirma_listesi,
+                          dosya_adi="solo_vs_ensemble.png"):
+    """Solo modeller + Ensemble F2 + CI bar chart'ı."""
+    if not MATPLOTLIB_OK:
+        return
+    sirali = sorted(karsilastirma_listesi,
+                     key=lambda x: x.get("test_f2", 0), reverse=True)
+    isimler = [r["model"] for r in sirali]
+    f2s     = [r["test_f2"] for r in sirali]
+    lo      = [r.get("f2_ci_low", r["test_f2"]) for r in sirali]
+    hi      = [r.get("f2_ci_high", r["test_f2"]) for r in sirali]
+    err_lo  = [f2s[i] - lo[i] for i in range(len(f2s))]
+    err_hi  = [hi[i] - f2s[i] for i in range(len(f2s))]
+
+    fig, ax = plt.subplots(figsize=(11, 6))
+    renkler = ["#2ca02c" if "ENSEMBLE" in n else "#1f77b4" for n in isimler]
+    bars = ax.bar(range(len(isimler)), f2s,
+                   yerr=[err_lo, err_hi], capsize=8,
+                   color=renkler, edgecolor="black", linewidth=1.2)
+
+    for i, (b, v) in enumerate(zip(bars, f2s)):
+        ax.text(b.get_x() + b.get_width()/2, v + 0.005,
+                 f"{v:.4f}", ha="center", va="bottom",
+                 fontsize=10, fontweight="bold")
+
+    ax.set_xticks(range(len(isimler)))
+    ax.set_xticklabels(isimler, rotation=20, ha="right")
+    ax.set_ylabel("Test F2 (Binary, pos=Patojenik)", fontsize=11, fontweight="bold")
+    ax.set_title("Solo Model vs Ensemble — Test Seti F2 Skoru (95% Bootstrap CI)",
+                  fontsize=13, fontweight="bold")
+    ax.grid(axis="y", linestyle="--", alpha=0.6)
+    ax.set_ylim([0.8, 1.0])
+    plt.tight_layout()
+    yol = os.path.join(GRAFIK_KLASOR, dosya_adi)
+    plt.savefig(yol, dpi=150, bbox_inches="tight")
+    plt.close()
+
+def shap_bar_grafigi(top_features, top_values,
+                      dosya_adi="shap_top_ozellikler.png"):
+    """SHAP top özellikler bar grafiği (açıklanabilirlik için)."""
+    if not MATPLOTLIB_OK:
+        return
+    fig, ax = plt.subplots(figsize=(9, 7))
+    y_pos = np.arange(len(top_features))
+    ax.barh(y_pos, top_values, color="#1f77b4", edgecolor="black")
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(top_features)
+    ax.invert_yaxis()
+    ax.set_xlabel("Ortalama |SHAP değeri|", fontsize=11, fontweight="bold")
+    ax.set_title("SHAP — Top 15 En Önemli Özellik\n(Açıklanabilirlik Analizi)",
+                  fontsize=12, fontweight="bold")
+    ax.grid(axis="x", linestyle="--", alpha=0.6)
+    for i, v in enumerate(top_values):
+        ax.text(v + max(top_values)*0.01, i, f"{v:.4f}",
+                 va="center", fontsize=9)
+    plt.tight_layout()
+    yol = os.path.join(GRAFIK_KLASOR, dosya_adi)
+    plt.savefig(yol, dpi=150, bbox_inches="tight")
+    plt.close()
+
+def karar_esigi_tablosu(y_true, y_proba, esikler=None):
+    """
+    Farklı karar eşiklerinde metrikleri hesapla.
+    TEKNOFEST'in 'Farklı karar eşiklerinin test sonuçları' zorunluluğu.
+    """
+    if esikler is None:
+        esikler = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40,
+                    0.45, 0.50, 0.55, 0.60, 0.65, 0.70]
+    sonuclar = []
+    for e in esikler:
+        pred = (y_proba >= e).astype(int)
+        cm = confusion_matrix(y_true, pred)
+        if cm.shape == (2, 2):
+            tn, fp, fn_, tp = cm.ravel()
+        else:
+            tn = fp = fn_ = tp = 0
+        f2 = fbeta_score(y_true, pred, beta=2, pos_label=1,
+                          average="binary", zero_division=0)
+        f1 = f1_score(y_true, pred, pos_label=1, average="binary", zero_division=0)
+        rec = recall_score(y_true, pred, pos_label=1, zero_division=0)
+        prec = precision_score(y_true, pred, pos_label=1, zero_division=0)
+        mcc = matthews_corrcoef(y_true, pred) if cm.shape == (2, 2) else 0
+        sonuclar.append({
+            "esik":      round(e, 2),
+            "F2":        round(f2, 4),
+            "F1":        round(f1, 4),
+            "Recall":    round(rec, 4),
+            "Precision": round(prec, 4),
+            "MCC":       round(mcc, 4),
+            "TP":        int(tp), "FP": int(fp),
+            "FN":        int(fn_), "TN": int(tn),
+        })
+    return sonuclar
 
 # v2.8 FIX #1+#5: Merkezi ES ayrım fonksiyonu
 def fold_es_ayir(X_fold_tr, y_fold_tr):
@@ -972,6 +1250,13 @@ if SHAP_OK and SHAP_PERCENTILE > 0:
         BUDANAN_OZELLIKLER = [c for c in all_cols if c not in kalan_cols]
 
         print(f"\n  {len(kalan_cols)} özellik kaldı ({budanan_cnt} budandı)")
+
+        # v4.1: SHAP top 15 özellik grafiği (rapor için açıklanabilirlik)
+        top15_idx = onem_sirasi[:15]
+        top15_features = [all_cols[i] for i in top15_idx]
+        top15_values   = [float(mean_abs_shap[i]) for i in top15_idx]
+        shap_bar_grafigi(top15_features, top15_values)
+        print(f"  → grafikler/shap_top_ozellikler.png kaydedildi.")
         del shap_values, shap_model, explainer
         gc.collect()
     except Exception as e:
@@ -1197,6 +1482,10 @@ faz1_df = faz1_df.sort_values("mean_f2", ascending=False)
 faz1_df.to_csv(CIKTI_FAZ1_CSV, index=False, encoding="utf-8")
 print(f"  FAZ 1 tablosu '{CIKTI_FAZ1_CSV}' kaydedildi.")
 
+# v4.1: FAZ 1 algoritma karşılaştırma bar chart
+faz1_karsilastirma_bar(eleme_raporu)
+print(f"  → grafikler/faz1_algoritma_karsilastirma.png kaydedildi.")
+
 if len(hayatta_kalan) < FAZ2_SECILEN_SAYI:
     print(f"\n  [UYARI] Yalnız {len(hayatta_kalan)} algoritma geçti, "
           f"FAZ 2 için {FAZ2_SECILEN_SAYI} gerekiyor. Top {FAZ2_SECILEN_SAYI} alınıyor.")
@@ -1255,6 +1544,10 @@ if nan_count > 0:
 print(korelasyon_df.round(3).to_string())
 korelasyon_df.to_csv(CIKTI_KORELASYON_CSV, encoding="utf-8")
 print(f"\n  Korelasyon matrisi '{CIKTI_KORELASYON_CSV}' kaydedildi.")
+
+# v4.1: Korelasyon heatmap
+korelasyon_heatmap(korelasyon_df)
+print(f"  → grafikler/faz2_korelasyon_heatmap.png kaydedildi.")
 
 # ── Greedy Çeşitlilik Seçimi ──────────────────────────────────────
 # 1) En yüksek F2'li algoritmayı seç
@@ -1654,6 +1947,22 @@ try:
 except Exception:
     test_auc_lo = test_auc_hi = test_auc
 
+# v4.1: PR-AUC (kesinlik-duyarlılık eğrisi altında kalan alan) — ZORUNLU metrik
+try:
+    test_pr_auc = float(average_precision_score(y_test, final_test_proba))
+    _, test_pr_auc_lo, test_pr_auc_hi = bootstrap_metric_ci(
+        y_test, final_test_proba, average_precision_score,
+    )
+except Exception:
+    test_pr_auc = 0.0
+    test_pr_auc_lo = test_pr_auc_hi = 0.0
+
+# OOF PR-AUC (overfitting karşılaştırması için)
+try:
+    oof_pr_auc = float(average_precision_score(y_train, kalibre_oof_proba))
+except Exception:
+    oof_pr_auc = 0.0
+
 # ─── PER-CLASS KLİNİK METRİKLER (POZİTİF SINIF = PATOJENİK) ─────────────
 test_recall_path    = float(recall_score(y_test, test_tahminler,
                                           pos_label=1, zero_division=0))
@@ -1680,6 +1989,7 @@ print("=" * 72)
 print(f"  F2 (binary, pos=patojenik) : {test_f2:.4f}  [95% CI: {test_f2_lo:.4f}-{test_f2_hi:.4f}]  ←─ Ana Metrik")
 print(f"  F1 (binary, pos=patojenik) : {test_f1:.4f}  [95% CI: {test_f1_lo:.4f}-{test_f1_hi:.4f}]")
 print(f"  AUC                        : {test_auc:.4f}  [95% CI: {test_auc_lo:.4f}-{test_auc_hi:.4f}]")
+print(f"  PR-AUC (Avg. Precision)    : {test_pr_auc:.4f}  [95% CI: {test_pr_auc_lo:.4f}-{test_pr_auc_hi:.4f}]")
 print(f"  MCC                        : {test_mcc:.4f}")
 print(f"  Doğruluk                   : %{test_acc*100:.2f}")
 print(f"  Eşik                       : {OPTIMAL_ESIK:.5f}")
@@ -1936,6 +2246,89 @@ df_karsi = pd.DataFrame(karsilastirma_listesi)
 df_karsi_sirali = df_karsi.sort_values("test_f2", ascending=False).reset_index(drop=True)
 df_karsi.to_csv("solo_vs_ensemble.csv", index=False, encoding="utf-8")
 
+# ─────────────────────────────────────────────────────────────────
+# v4.1: GÖRSELLER — TEKNOFEST raporu için zorunlu
+# ─────────────────────────────────────────────────────────────────
+print(f"\n  Görseller üretiliyor (grafikler/ klasörüne)...")
+
+# 1. Ensemble confusion matrix
+confusion_matrix_gorseli(y_test, test_tahminler,
+                          "ENSEMBLE (4-faz pipeline)",
+                          "cm_ensemble.png")
+
+# 2. Solo modeller için CM (sadece eğitilmiş olanlar — yeniden eğitmek
+# pahalı, en iyi 2 solo için yapalım)
+en_iyi_3_solo = sorted(solo_sonuclari, key=lambda x: x.get("test_f2", 0),
+                        reverse=True)[:3]
+for i, s in enumerate(en_iyi_3_solo):
+    ad = s["model"]
+    print(f"  → {ad} CM hesaplanıyor (yeniden tahmin)...")
+    # Modeli yeniden eğit ve tahmin yap (probs gerekiyor, depolamadık)
+    try:
+        if "CatBoost" in ad and CB_OK:
+            m = _solo_fit_cb()
+            probs = _solo_pred_cb(m, X_test)
+        elif "ExtraTrees" in ad:
+            m = _solo_fit_et()
+            probs = _solo_pred_et(m, X_test)
+        elif "LightGBM" in ad and LGBM_OK:
+            m = _solo_fit_lgb()
+            probs = _solo_pred_lgb(m, X_test)
+        elif "Random Forest" in ad:
+            m = _solo_fit_rf()
+            probs = _solo_pred_rf(m, X_test)
+        elif "XGBoost" in ad:
+            m = _solo_fit_xgb()
+            probs = _solo_pred_xgb(m, X_test)
+        else:
+            continue
+        esik = s["optimal_esik"]
+        pred = (probs >= esik).astype(int)
+        # Confusion matrix
+        guvenli_ad = ad.replace(" ", "_").replace("(", "").replace(")", "")
+        confusion_matrix_gorseli(y_test, pred, ad,
+                                  f"cm_solo_{i+1}_{guvenli_ad}.png")
+        # ROC/PR için sakla
+        if i == 0:  # en iyi solo
+            en_iyi_solo_probs = probs
+            en_iyi_solo_ad    = ad
+        del m
+        gc.collect()
+    except Exception as e:
+        print(f"    [UYARI] {ad} CM atlandı: {e}")
+
+# 3. Solo vs Ensemble bar chart
+solo_vs_ensemble_bar(karsilastirma_listesi)
+print(f"  → grafikler/solo_vs_ensemble.png")
+
+# 4. ROC + PR curve karşılaştırma (Ensemble vs en iyi solo)
+try:
+    proba_dict = {"Ensemble (4-faz)": final_test_proba}
+    if 'en_iyi_solo_probs' in dir():
+        proba_dict[en_iyi_solo_ad] = en_iyi_solo_probs
+    roc_pr_curve_karsilastirma(y_test, proba_dict)
+    print(f"  → grafikler/roc_pr_curves.png")
+except Exception as e:
+    print(f"  [UYARI] ROC/PR grafiği atlandı: {e}")
+
+# 5. Karar eşiği tablosu (TEKNOFEST zorunlu)
+print(f"\n  Farklı Karar Eşiklerinde Performans (Ensemble Test):")
+esik_sonuc = karar_esigi_tablosu(y_test, final_test_proba)
+print(f"\n    {'Eşik':>6} {'F2':>7} {'F1':>7} {'Recall':>7} "
+      f"{'Precision':>10} {'MCC':>7} {'TP':>3} {'FP':>3} {'FN':>3} {'TN':>3}")
+print(f"    {'-'*6} {'-'*7} {'-'*7} {'-'*7} {'-'*10} {'-'*7} "
+      f"{'-'*3} {'-'*3} {'-'*3} {'-'*3}")
+for r in esik_sonuc:
+    is_optimal = abs(r["esik"] - OPTIMAL_ESIK) < 0.025
+    marker = " ★" if is_optimal else "  "
+    print(f"   {marker}{r['esik']:>6.2f} {r['F2']:>7.4f} {r['F1']:>7.4f} "
+          f"{r['Recall']:>7.4f} {r['Precision']:>10.4f} {r['MCC']:>7.4f} "
+          f"{r['TP']:>3} {r['FP']:>3} {r['FN']:>3} {r['TN']:>3}")
+# Karar eşiği tablosunu CSV olarak da kaydet
+pd.DataFrame(esik_sonuc).to_csv("karar_esigi_tablosu.csv",
+                                   index=False, encoding="utf-8")
+print(f"\n  → karar_esigi_tablosu.csv kaydedildi (rapor için).")
+
 # ══════════════════════════════════════════════════════════════════
 #  TEKNOFEST JÜRİ SUNUM BLOKU — Hibrit Karşılaştırma
 # ══════════════════════════════════════════════════════════════════
@@ -2001,7 +2394,7 @@ for k in ["n_jobs", "thread_count", "verbosity", "verbose",
 
 sonuc = {
     "_aciklama": {
-        "surum"          : "BioSense AI v4.0 — Hibrit (Solo + Ensemble) Jüri Sunumu",
+        "surum"          : "BioSense AI v4.1 — TEKNOFEST Tam Pipeline (PR-AUC, görseller, eşik tablosu)",
         "pipeline"       : [
             "Faz 1: 10 algo geniş tarama + hibrit istatistiksel eleme",
             "Faz 2: Korelasyon + greedy çeşitlilik seçimi → top 3",
@@ -2086,6 +2479,8 @@ sonuc = {
         "test_f1_ci95"   : [round(test_f1_lo, 4), round(test_f1_hi, 4)],
         "test_auc"       : round(test_auc, 4),
         "test_auc_ci95"  : [round(test_auc_lo, 4), round(test_auc_hi, 4)],
+        "test_pr_auc"    : round(test_pr_auc, 4),                                # v4.1 yeni
+        "test_pr_auc_ci95": [round(test_pr_auc_lo, 4), round(test_pr_auc_hi, 4)],
         "test_mcc"       : round(test_mcc, 4),
         "test_acc_pct"   : round(test_acc * 100, 4),
         "test_recall"    : round(test_recall, 4),
@@ -2094,8 +2489,10 @@ sonuc = {
         "oof_f2"         : round(oof_f2, 4),
         "oof_f1"         : round(oof_f1, 4),
         "oof_auc"        : round(oof_auc, 4),
+        "oof_pr_auc"     : round(oof_pr_auc, 4),                                 # v4.1 yeni
         "oof_mcc"        : round(oof_mcc, 4),
     },
+    "karar_esigi_tablosu": esik_sonuc,    # v4.1: TEKNOFEST zorunlu
     "klinik_metrikler": {
         "_aciklama": "Patojenik (class 1) için özel hesaplanan klinik metrikler. "
                      "False Negative = kaçırılan patojenik → klinik risk. "
@@ -2148,6 +2545,14 @@ print(f"  '{CIKTI_JSON}' kaydedildi.")
 print(f"  '{CIKTI_FAZ1_CSV}' (FAZ 1 tablosu)")
 print(f"  '{CIKTI_KORELASYON_CSV}' (FAZ 2 korelasyon matrisi)")
 print(f"  'solo_vs_ensemble.csv' (v4.0 jüri karşılaştırması)")
+print(f"  'karar_esigi_tablosu.csv' (v4.1 TEKNOFEST zorunlu)")
+print(f"  'grafikler/' klasöründe 8 PNG görsel:")
+print(f"     - shap_top_ozellikler.png")
+print(f"     - faz1_algoritma_karsilastirma.png")
+print(f"     - faz2_korelasyon_heatmap.png")
+print(f"     - cm_ensemble.png + cm_solo_*.png (4 adet)")
+print(f"     - solo_vs_ensemble.png")
+print(f"     - roc_pr_curves.png")
 print("\n" + "=" * 72)
-print("  BioSense AI v4.0 — TAMAMLANDI")
+print("  BioSense AI v4.1 — TAMAMLANDI")
 print("=" * 72)
