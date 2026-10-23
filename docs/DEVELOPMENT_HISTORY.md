@@ -20,6 +20,8 @@ Bu başlıklar kod ve yerel notların özetidir; eski notlarda yazan hız veya b
 
 `source-history.json`, 25 eğitim kopyası yanında F1 sürümü ve güncel arayüzün özgün dosya adını, boyutunu, değiştirme zamanını ve SHA-256 özetini içerir. Yarışma verilerinin hash'leri veya içerikleri burada yer almaz.
 
+SHA-256 özetleri özgün dosyanın ham baytlarına aittir. Git'in LF satır sonu normalizasyonu nedeniyle `git show` ile alınan içeriğin özeti farklı olabilir.
+
 Arşiv commit'leri özgün eğitim kodunu korur. Güncel sürümlerde eski kullanım başlığı sadeleştirildi, hatalı depo bağlantısı kaldırıldı ve `BIOSENSE_DATA_DIR` üzerinden ayrı giriş klasörü desteği eklendi. Eğitim algoritması yeniden tasarlanmadı. Arayüzde mevcut ID çakışması uyarısına işlemi durdurma eklendi.
 
 Arşiv sürümleri yalnızca inceleme içindir. Eski hatalar ve ağır varsayılan eğitim bütçeleri içerebilir; yeni kullanım için `main` dalındaki başlatıcı tercih edilmelidir.
