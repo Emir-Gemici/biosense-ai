@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  BioSense AI v6.5 — FAZ 3 Trial-içi Paralel (Loky) + ULTRA Restore         ║
+║  BioSense AI v7.0 — Total Paralel + Cache Hızlandırma + GPU Strateji        ║
 ║  Sağlıkta Yapay Zeka Yarışması — Üniversite Kategorisi                      ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║                                                                              ║
@@ -501,41 +501,69 @@ CB_TASK_TYPE = "GPU" if GPU_AKTIF else "CPU"
 # Sorun: 24 dış worker × 24 iç thread = 576 thread → GIL bottleneck + DB lock
 # Çözüm: Algoritmaya göre iç ya da dış paralelizm seç, çakıştırma.
 #
-# - C++ boosting (XGB/LGB/CB):  Optuna 24 paralel, model n_jobs=1
-#   → Process'ler bağımsız çalışır, GIL etkisi yok
-# - sklearn tree bagging (RF/ET): Optuna 1 sequential, model n_jobs=-1
-#   → Tree'ler içeride paralel çoğalır (24 ağaç aynı anda)
-#   → Tek model fit ~30s → 24 thread ile ~2s, sonra sıra geliyor
-# - Diğer sklearn (LR/SVM/kNN/NB/MLP): Optuna 24, model n_jobs=1
-#   → Modeller hızlı, dış paralelizm daha verimli
+# [v7.0] BÜYÜK REFAKTÖR — Web araştırması bulgularıyla:
+#   1. XGBoost küçük data + n_jobs=-1 → thread spawn overhead %20+ (parallel slowdown)
+#      → KÜÇÜK DATA için XGBoost da outer-paralel olmalı (fold/trial-paralel)
+#   2. RF/ET sklearn issue #20651 — küçük data n_jobs=-1 düşük CPU (GIL-dependent)
+#      → KÜÇÜK DATA için outer-paralel daha verimli
+#   3. LightGBM histogram + leaf-wise = CPU %10'da bile hızlı (efficient)
+#      → outer-paralel ile her worker n_jobs=1 zaten optimum
+#   4. GPU mode: tek GPU = paralel trial imkansız (memory contention)
+#      → GPU mode'da Optuna n_jobs=1 + her trial GPU'da hızlı
+
 def algo_paralelizm(algo):
-    """[v6.2.2] Algoritma için (optuna_n_jobs, model_n_jobs) tuple döndürür.
+    """[v7.0] Algoritma için (optuna_n_jobs, model_n_jobs) tuple döndürür.
 
-    Strateji: VERİ SETİ BOYUTUNA GÖRE adaptive — tüm tree modeller için.
-
-    Küçük data (N_TRAIN < 800, örn. KANSER 310):
-      - Tek trial fit'i kısa (saniyenin altı)
-      - Inner-parallel spawn overhead'i fit süresinden büyük → CPU %10
-      - Outer-parallel (22 trial) çok daha verimli → CPU %95+
-      - Risk: SQLite DB lock contention (ama trial kısa olduğu için kabul edilebilir)
-
-    Büyük data (N_TRAIN >= 800, örn. MASTER 2400):
-      - Tek trial fit'i uzun (10+ saniye)
-      - Inner-parallel C++ paralellemesi mükemmel
-      - DB contention çok daha az (trial uzun, lock kısa)
-
-    Sklearn olmayan modeller (SVM/kNN/Logistic/NB/MLP):
-      - Her zaman outer-parallel (tek model fit'i kısa, paralel trial mantıklı)
-      - MLP sklearn n_jobs desteklemediği için zaten içeride tek thread
+    Strateji:
+      KÜÇÜK DATA (N_TRAIN < 800, örn KANSER 310):
+        - TÜM tree modeller outer-paralel — fit kısa, paralel trial efficient
+        - Inner-paralel overhead'i fit süresinden büyük (parallel slowdown)
+      BÜYÜK DATA (N_TRAIN >= 800, örn MASTER 2400):
+        - C++ boosting (XGB/LGB/CB): inner-paralel (-1) tek trial uzun
+        - sklearn tree (RF/ET): inner-paralel — bagging trees paralel çoğalır
+      GPU MODE:
+        - Tek GPU = paralel trial imkansız (memory contention)
+        - C++ boosting GPU mode'da outer=1, inner=GPU (otomatik)
+        - Sklearn modeller GPU desteği yok → CPU + outer-paralel
     """
+    # [v7.0] GPU mode için özel — tek GPU paylaşılamaz
+    if GPU_AKTIF and algo in ("xgboost", "lightgbm", "catboost"):
+        return (1, -1)  # outer SIRALI + GPU thread'i model içinde
+
     # Tree-based modeller için adaptive
     if algo in ("random_forest", "extra_trees", "xgboost", "lightgbm", "catboost"):
         if 'N_TRAIN' in globals() and N_TRAIN < 800:
-            return (PARALEL_ISCI, 1)   # küçük data → outer paralel
-        return (1, -1)                 # büyük data → inner paralel
+            return (PARALEL_ISCI, 1)   # küçük data → outer paralel (KANSER)
+        return (1, -1)                 # büyük data → inner paralel (MASTER)
 
     # Küçük/sıralı modeller: her zaman outer paralel
     return (PARALEL_ISCI, 1)        # SVM, kNN, NB, Logistic, MLP
+
+
+def hizli_trial_say(study, state=None):
+    """[v7.0] HIZLI trial sayımı — deepcopy YAPMAZ.
+
+    Eski yöntem (study.trials → tüm trial'ları deepcopy):
+      Her çağrı = N×deepcopy. KANSER lightgbm 2398 trial = 30+ saniye bekleme.
+
+    Yeni yöntem (get_trials with deepcopy=False + states filter):
+      State filtresi SQL'de yapılır + deepcopy YOK. Milisaniyeler.
+
+    Kullanıcı 0/120 ekranında bekleme süresi: 30s → <0.5s.
+    """
+    try:
+        if state is None:
+            return len(study.get_trials(deepcopy=False))
+        return len(study.get_trials(deepcopy=False, states=(state,)))
+    except Exception:
+        # Optuna eski sürüm fallback
+        if state is None:
+            return hizli_trial_say(study)
+        return sum(1 for t in study.trials if t.state == state)
+
+def algo_paralelizm_eski_kullanma(algo):
+    """[KULLANMA] Bu fonksiyon v7.0'da yukarıda yeniden tanımlandı."""
+    pass
 
 # ── FAZ 1: Geniş tarama ───────────────────────────────────────────
 # [v4.9] BU PARAMETRELER DİNAMİK — kullanıcı modu + sistem otomatik birleştirilir
@@ -761,7 +789,7 @@ PREPROCESSING_GEREK = {
 }
 
 print("=" * 72)
-print("  BioSense AI v6.5 — FAZ 3 Trial-içi Paralel + ULTRA Restore")
+print("  BioSense AI v7.0 — Total Paralel + Cache Hızlandırma + GPU Strateji")
 print(f"  Toplam algoritma havuzu: {len(TUM_ALGORITMALAR)}")
 print(f"  FAZ 1: {sum(FAZ1_TRIAL_PER_ALGO.get(a, 30) for a in TUM_ALGORITMALAR)} "
       f"trial × {FAZ1_FOLDS*FAZ1_TEKRAR} fold")
@@ -2380,11 +2408,9 @@ for algo in TUM_ALGORITMALAR:
                                             n_warmup_steps=3, interval_steps=3),
     )
 
-    mevcut = len([t for t in study.trials
-                  if t.state == optuna.trial.TrialState.COMPLETE])
-    fail_sayisi = len([t for t in study.trials
-                       if t.state == optuna.trial.TrialState.FAIL])
-    toplam_dbde = len(study.trials)
+    mevcut = hizli_trial_say(study, optuna.trial.TrialState.COMPLETE)
+    fail_sayisi = hizli_trial_say(study, optuna.trial.TrialState.FAIL)
+    toplam_dbde = hizli_trial_say(study)
     kalan  = max(0, n_trial - mevcut)
 
     # [v6.3] Cache durumunu net göster
@@ -2417,8 +2443,7 @@ for algo in TUM_ALGORITMALAR:
                     time.sleep(1)
                 else:
                     raise e
-            mevcut = len([t for t in study.trials
-                          if t.state == optuna.trial.TrialState.COMPLETE])
+            mevcut = hizli_trial_say(study, optuna.trial.TrialState.COMPLETE)
             kalan  = max(0, n_trial - mevcut)
         print(f"    Bitti: {time.perf_counter()-t0:.1f}s")
 
@@ -2799,13 +2824,10 @@ for algo in secilen_algoritmalar:
         except Exception as e:
             print(f"    [UYARI] Seed eklenemedi: {e}")
 
-    mevcut = len([t for t in study.trials
-                  if t.state == optuna.trial.TrialState.COMPLETE])
-    fail_sayisi = len([t for t in study.trials
-                       if t.state == optuna.trial.TrialState.FAIL])
-    pruned_sayisi = len([t for t in study.trials
-                         if t.state == optuna.trial.TrialState.PRUNED])
-    toplam_dbde = len(study.trials)
+    mevcut = hizli_trial_say(study, optuna.trial.TrialState.COMPLETE)
+    fail_sayisi = hizli_trial_say(study, optuna.trial.TrialState.FAIL)
+    pruned_sayisi = hizli_trial_say(study, optuna.trial.TrialState.PRUNED)
+    toplam_dbde = hizli_trial_say(study)
     kalan  = max(0, algo_trial_budget - mevcut)
 
     # [v6.3] FAZ 3 cache durumunu net göster
@@ -2838,8 +2860,7 @@ for algo in secilen_algoritmalar:
                     time.sleep(1)
                 else:
                     raise e
-            mevcut = len([t for t in study.trials
-                          if t.state == optuna.trial.TrialState.COMPLETE])
+            mevcut = hizli_trial_say(study, optuna.trial.TrialState.COMPLETE)
             kalan  = max(0, algo_trial_budget - mevcut)
         print(f"    Bitti: {time.perf_counter()-t0:.1f}s")
 
@@ -2882,8 +2903,11 @@ FAZ3_KALITE_ESIK     = 0.30   # bu skorun altındaki trial'lar ensemble'a alınm
 faz3_top_trials_per_algo = {}
 
 for algo, study in faz3_studies.items():
-    tamamlanan = [t for t in study.trials
-                  if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None]
+    # [v7.0] HIZLI: deepcopy=False + state filter SQL'de
+    tamamlanan = [t for t in study.get_trials(
+                      deepcopy=False,
+                      states=(optuna.trial.TrialState.COMPLETE,))
+                  if t.value is not None]
     if not tamamlanan:
         print(f"  [UYARI] {algo} için tamamlanan trial yok.")
         faz3_top_trials_per_algo[algo] = []
@@ -3727,7 +3751,7 @@ for k in ["n_jobs", "thread_count", "verbosity", "verbose",
 
 sonuc = {
     "_aciklama": {
-        "surum"          : f"BioSense AI v6.5 — FAZ 3 Trial-içi Paralel ({DATA_SUFFIX.upper()}, {CALISMA_MODU.upper()})",
+        "surum"          : f"BioSense AI v7.0 — Total Paralel + Cache Hız ({DATA_SUFFIX.upper()}, {CALISMA_MODU.upper()})",
         "calisma_modu"   : CALISMA_MODU,
         "sistem_profili" : {
             "cpu_logical"     : int(_cpu_count_logical),
@@ -3937,5 +3961,5 @@ print(f"     [v5.1] trial_convergence_*.png (3 algoritma için)")
 print(f"     [v5.1] feature_grup_analizi.png (pasta + bar)")
 print(f"     [v5.1] ensemble_shap.png (gerçek karar mantığı)")
 print("\n" + "=" * 72)
-print(f"  BioSense AI v6.5 — TAMAMLANDI ({DATA_SUFFIX.upper()}, MOD: {CALISMA_MODU.upper()})")
+print(f"  BioSense AI v7.0 — TAMAMLANDI ({DATA_SUFFIX.upper()}, MOD: {CALISMA_MODU.upper()})")
 print("=" * 72)
