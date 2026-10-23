@@ -1,0 +1,167 @@
+{
+  "note": "Original local source metadata; modification times are not verified authorship dates. Commits were imported retrospectively at the actual import date.",
+  "sources": [
+    {
+      "source_file": "biosense_v2_ultra.py",
+      "observed_modified_time": "2026-05-13T22:18:22+03:00",
+      "sha256": "e1b4b7d0fd20eec482b4860cf77de173316ebfbdef57f42cacfaeb01f1c3eb11",
+      "bytes": 44132
+    },
+    {
+      "source_file": "biosense_v2.7_ultra.py",
+      "observed_modified_time": "2026-05-16T09:23:07+03:00",
+      "sha256": "a01bcb3d776e90ae69507dd91d3f8fa8d3683aeb323ae86a977a591d04b2b328",
+      "bytes": 55839
+    },
+    {
+      "source_file": "biosense_v3.3_ultra.py",
+      "observed_modified_time": "2026-05-16T22:39:59+03:00",
+      "sha256": "3bc15616510b80f5b3ae8a061dde962e5be2f5b9d080d45bf4b8e4ff3cc2b9f9",
+      "bytes": 82815
+    },
+    {
+      "source_file": "biosense_v3.5_ultra.py",
+      "observed_modified_time": "2026-05-17T18:29:37+03:00",
+      "sha256": "ef822279d23277e4ceb6a1bc3457f84aa0bf1e6c05ffa76501d2f336eb0d3f46",
+      "bytes": 88124
+    },
+    {
+      "source_file": "biosense_v3.6_ultra.py",
+      "observed_modified_time": "2026-05-18T00:35:00+03:00",
+      "sha256": "fb12a1869b8f992e77ba2e8cd137b7175ff63a9c43cdf6cbb5a3effd951e8060",
+      "bytes": 90295
+    },
+    {
+      "source_file": "biosense_v4_ultra.py",
+      "observed_modified_time": "2026-05-18T10:33:20+03:00",
+      "sha256": "91802f8bc06c52d5553353ba14bd100de63e6842bea666e040ae2eb51ebada5a",
+      "bytes": 100992
+    },
+    {
+      "source_file": "biosense_v4.1_ultra.py",
+      "observed_modified_time": "2026-05-18T16:14:24+03:00",
+      "sha256": "df21fc100c2620368f91b6167d8a8bfc9a72e3e3de4748086b2deb211ebe567b",
+      "bytes": 121156
+    },
+    {
+      "source_file": "biosense_v4.3_ultra.py",
+      "observed_modified_time": "2026-05-19T10:04:35+03:00",
+      "sha256": "d3caa630a1fd45ad0cdc66cc82fd2cfdcf6d6ed6cc2c72c5486710e8089e4ed0",
+      "bytes": 123969
+    },
+    {
+      "source_file": "biosense_v4.5_ultra.py",
+      "observed_modified_time": "2026-05-19T14:57:10+03:00",
+      "sha256": "1a9ca093cb60582210b66df7589869cb445f3f561c4121667853c07baf1aa11a",
+      "bytes": 126851
+    },
+    {
+      "source_file": "biosense_v5.1_ultra.py",
+      "observed_modified_time": "2026-05-20T10:41:27+03:00",
+      "sha256": "a2006b9c2c7c72a97432fa656ac1bdf277d05552d3ec86b78b883e39e338a215",
+      "bytes": 159450
+    },
+    {
+      "source_file": "biosense_v5.5_ultra.py",
+      "observed_modified_time": "2026-05-23T11:49:02+03:00",
+      "sha256": "d55c8d63dd81061d5d56f23959683f38e5d4475cdbf8a5f40d79c4f7a346bfe5",
+      "bytes": 162785
+    },
+    {
+      "source_file": "biosense_v6.0_ultra.py",
+      "observed_modified_time": "2026-05-23T16:46:43+03:00",
+      "sha256": "54553a03784ac236c08b1ac6e9b009fc533a194f31f5befb9abc9257e1e5fa54",
+      "bytes": 167646
+    },
+    {
+      "source_file": "biosense_v6.1_ultra.py",
+      "observed_modified_time": "2026-05-23T16:54:15+03:00",
+      "sha256": "3e817a45e5e60c98c6d0502dfaf33d03bb0c25236dd7d823e813e652845c11e4",
+      "bytes": 173638
+    },
+    {
+      "source_file": "biosense_v6.2.1_ultra.py",
+      "observed_modified_time": "2026-05-24T15:42:50+03:00",
+      "sha256": "c39350f0c463c8ea302e7995407d7d1c0e24b28ee60c2a58c93e54878fa6c184",
+      "bytes": 176090
+    },
+    {
+      "source_file": "biosense_v6.2.2_ultra.py",
+      "observed_modified_time": "2026-05-24T17:04:28+03:00",
+      "sha256": "102261857ec26e0b1dac7390a6a8087cac6028f0c2fa3d680418045524b2cb98",
+      "bytes": 178907
+    },
+    {
+      "source_file": "biosense_v6.3_ultra.py",
+      "observed_modified_time": "2026-05-25T16:50:08+03:00",
+      "sha256": "e65b5b9fd2757cd9b1e46f55848408c6033d4c7be1ad0dcfd593529c53fadfc8",
+      "bytes": 183134
+    },
+    {
+      "source_file": "biosense_v6.4_ultra.py",
+      "observed_modified_time": "2026-05-25T17:01:58+03:00",
+      "sha256": "c69cd5ade2629e83d2e7fbcc44a6485e7ad10ff4bc51651e9c7e692a8c041d2c",
+      "bytes": 186900
+    },
+    {
+      "source_file": "biosense_ai_v6.5.py",
+      "observed_modified_time": "2026-05-26T11:53:53+03:00",
+      "sha256": "4045ec037bf601140791596994cbb8b5b2284069baacbe39e23daf4765350c65",
+      "bytes": 185170
+    },
+    {
+      "source_file": "biosense_ai_v7.0.py",
+      "observed_modified_time": "2026-05-26T16:06:21+03:00",
+      "sha256": "54c5a989146312cf1c02dfd06df6b3d7beb536e59189d691ebbe5cb430b7d64a",
+      "bytes": 190144
+    },
+    {
+      "source_file": "biosense_ai_v7.1.py",
+      "observed_modified_time": "2026-05-27T14:37:22+03:00",
+      "sha256": "f0ee892f63a27e3f0ab8b702b9d77feff07fa90652719f7e54f98cd388b3496a",
+      "bytes": 196799
+    },
+    {
+      "source_file": "biosense_ai_v7.2.py",
+      "observed_modified_time": "2026-05-27T20:29:25+03:00",
+      "sha256": "5e7fb1452501352fb6ffb79f844517d7c6704c8b90cd6b3d79101184791ca952",
+      "bytes": 206021
+    },
+    {
+      "source_file": "biosense_ai_v7.5.py",
+      "observed_modified_time": "2026-05-27T21:54:37+03:00",
+      "sha256": "954c98c801d8b82660b883b1796544c02e82d1edfcb326e363a3cd4f219929ee",
+      "bytes": 207300
+    },
+    {
+      "source_file": "biosense_ai_v7.7.py",
+      "observed_modified_time": "2026-05-28T10:59:24+03:00",
+      "sha256": "61275977f440ee97b2933467a3e93171ac9ae4326d5acbffd72f0a5738da2db3",
+      "bytes": 214958
+    },
+    {
+      "source_file": "biosense_ai_v7.8.py",
+      "observed_modified_time": "2026-05-28T16:44:51+03:00",
+      "sha256": "57ecc15313a79b9c2f0bacab8c73206aaaf434a55a7874c7139b3573c17407f6",
+      "bytes": 218734
+    },
+    {
+      "source_file": "biosense_ai_v7.9.py",
+      "observed_modified_time": "2026-05-29T13:56:35+03:00",
+      "sha256": "1d066657f21787bff08d2f99a34893e1c53e787da9b13c39177c2808b8095c33",
+      "bytes": 222195
+    },
+    {
+      "source_file": "biosense_ai_v7.9x.py",
+      "observed_modified_time": "2026-06-14T21:24:04+03:00",
+      "sha256": "7a00ba690fd689d70c16187863ab0dd35f4e6719c22b7175372cc8555dc3907a",
+      "bytes": 223256
+    },
+    {
+      "source_file": "biosense_test_arayuzu.py",
+      "observed_modified_time": "2026-06-14T20:37:29+03:00",
+      "sha256": "6cf45ed516d492e34f8e5ae2a71623b5371d7315fbd6004ee9a2d4901e45816e",
+      "bytes": 47441
+    }
+  ]
+}
