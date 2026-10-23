@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  BioSense AI v3.5 — 4-FAZ HİYERARŞİK ALGORİTMA SEÇİMİ                       ║
+║  BioSense AI v3.6 — 4-FAZ HİYERARŞİK ALGORİTMA SEÇİMİ                       ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  FAZ 1: 10 algoritma geniş tarama (5×20=100 fold)                            ║
 ║         Hibrit eleme: F2_ort<0.70 + (F2_ort-0.5×std)<0.65 + Welch p<0.05     ║
@@ -46,6 +46,15 @@
 ║      Optuna objective, eşik optimizasyonu, test raporlama hepsi binary'de   ║
 ║   ✓ FAZ 1 tablosuna F1_ort sütunu eklendi (sadece raporlama amaçlı)         ║
 ║      Eleme ve seçim hâlâ F2 ile, F1 jüri kıyaslaması için durur             ║
+║                                                                              ║
+║  v3.5 → v3.6 DÜZELTMELERİ (gerçek-veri run'larından çıkanlar):              ║
+║   ✓ FIX M: Kategorik kolonların NaN'ları "EKSİK" string'i ile dolduruluyor  ║
+║      CatBoost float NaN'ı cat_features'da kabul etmiyor → v3.4'te crash    ║
+║      oluyordu. Bu fix sonrası CatBoost FAZ 1'de en iyi F2=0.9615 verdi.    ║
+║   ✓ FIX N: FAZ 3 trial bütçesi algoritmaya göre dict (1500 sabit yerine)   ║
+║      sklearn algos (RF/ET/LR/SVM/kNN/NB/MLP) GIL + joblib overhead'ten      ║
+║      dolayı CPU %10'a düşüyor, 6 saatlik tahminler veriyor. Algo-bazlı     ║
+║      bütçe → FAZ 3 toplam süre ~18 saat'ten ~4 saat'e indi.                ║
 ║                                                                              ║
 ║  v2.8'in tüm FIX #1-#20 düzeltmeleri korundu.                                ║
 ║  10 algoritma: 3 boosting + 2 bagging + 1 linear + 1 kernel + 1 instance-    ║
@@ -152,7 +161,28 @@ FAZ2_SECILEN_SAYI  = 3       # final ensemble paradigma sayısı
 FAZ2_OOF_ES_SPLIT  = 0.12
 
 # ── FAZ 3: Derin Tuning ───────────────────────────────────────────
-FAZ3_TRIAL_PER_ALGO = 1500
+# [FIX N] Algoritma bazlı trial bütçesi. Önceki tek-sayı yaklaşımı
+# (1500 her algoritma için) sklearn-tabanlı algos için verimsizdi:
+# - XGB/LGB/CB: C++ tabanlı, paralelizm verimli → 1000-1500 trial mantıklı
+# - sklearn (RF, ET, LR, SVM, kNN, NB, MLP): Python GIL + joblib spawn
+#   overhead → CPU %10'a düşüyor. 500 trial sklearn için zaten doyurur,
+#   hyperparameter yüzeyleri daha düz.
+# Net etki: FAZ 3 toplam süresi ~18 saat → ~4 saat.
+FAZ3_TRIAL_PER_ALGO = {
+    # C++ tabanlı boosting — paralelizm verimli
+    "xgboost":       1500,
+    "lightgbm":      1500,
+    "catboost":      1000,
+    # sklearn tree — paralelizm verimsiz, az trial yeterli
+    "random_forest":  500,
+    "extra_trees":    500,
+    # sklearn non-tree
+    "logistic":       600,
+    "svm_rbf":        400,   # probability=True yavaş
+    "knn":            200,   # 3 hyperparam, hızla doyurur
+    "naive_bayes":    100,   # 1 hyperparam
+    "mlp":            800,
+}
 FAZ3_FOLDS          = 5
 FAZ3_TEKRAR         = 10     # 50 fold
 FAZ3_DB_PREFIX      = "sqlite:///biosense_faz3_v3"
@@ -217,11 +247,11 @@ PREPROCESSING_GEREK = {
 }
 
 print("=" * 72)
-print("  BioSense AI v3.5 — 4-FAZ HİYERARŞİK (binary F2 + F1 kıyas)")
+print("  BioSense AI v3.6 — 4-FAZ HİYERARŞİK (binary F2 + algo-bazlı bütçe)")
 print(f"  Toplam algoritma havuzu: {len(TUM_ALGORITMALAR)}")
 print(f"  FAZ 1: {sum(FAZ1_TRIAL_PER_ALGO.get(a, 30) for a in TUM_ALGORITMALAR)} "
       f"trial × {FAZ1_FOLDS*FAZ1_TEKRAR} fold")
-print(f"  FAZ 3: {FAZ2_SECILEN_SAYI} algo × {FAZ3_TRIAL_PER_ALGO} trial × "
+print(f"  FAZ 3: {FAZ2_SECILEN_SAYI} algo × (algo-bazlı trial) × "
       f"{FAZ3_FOLDS*FAZ3_TEKRAR} fold")
 print("=" * 72)
 
@@ -262,11 +292,13 @@ KAT_KOLONLAR = []
 for col in X.columns:
     if (X[col].dtype == "object" or X[col].dtype.name == "category"
             or str(col).startswith("CAT_") or str(col).startswith("AA_")):
-        
-        # [FIX CatBoost NaN] Boşluklar float (NaN) olarak kalmasın, 
-        # CatBoost'un okuyabileceği "EKSİK" stringine dönüşsün!
+        # [FIX M] Kategorik kolonlardaki float NaN'lar CatBoost tarafından
+        # okunamıyordu (CatBoost cat_features parametresinde float NaN'ı
+        # kabul etmez). Onları "EKSİK" string'i ile dolduralım — CatBoost
+        # bunu ayrı bir kategori olarak ele alır, tree-numeric / non-tree
+        # algos da numerik kodlama sırasında bu kategoriyi doğru işler.
+        # v3.4 run'da CatBoost crash'inin asıl sebebi buydu.
         X[col] = X[col].fillna("EKSİK").astype(str).astype("category")
-        
         KAT_KOLONLAR.append(col)
 
 X_train, X_test, y_train, y_test = train_test_split(
@@ -1308,7 +1340,9 @@ faz3_studies = {}
 
 for algo in secilen_algoritmalar:
     db_url = f"{FAZ3_DB_PREFIX}_{algo}.db"
-    print(f"\n  ── {algo.upper():<14} ─── {FAZ3_TRIAL_PER_ALGO} trial × {FAZ3_FOLDS*FAZ3_TEKRAR} fold")
+    # [FIX N] Algo-bazlı bütçe (sklearn'lerden tasarruf)
+    algo_trial_budget = FAZ3_TRIAL_PER_ALGO.get(algo, 500)
+    print(f"\n  ── {algo.upper():<14} ─── {algo_trial_budget} trial × {FAZ3_FOLDS*FAZ3_TEKRAR} fold")
 
     study = optuna.create_study(
         study_name=f"faz3_{algo}",
@@ -1337,7 +1371,7 @@ for algo in secilen_algoritmalar:
 
     mevcut = len([t for t in study.trials
                   if t.state == optuna.trial.TrialState.COMPLETE])
-    kalan  = max(0, FAZ3_TRIAL_PER_ALGO - mevcut)
+    kalan  = max(0, algo_trial_budget - mevcut)
 
     if kalan > 0:
         t0 = time.perf_counter()
@@ -1355,7 +1389,7 @@ for algo in secilen_algoritmalar:
                     raise e
             mevcut = len([t for t in study.trials
                           if t.state == optuna.trial.TrialState.COMPLETE])
-            kalan  = max(0, FAZ3_TRIAL_PER_ALGO - mevcut)
+            kalan  = max(0, algo_trial_budget - mevcut)
         print(f"    Bitti: {time.perf_counter()-t0:.1f}s")
 
     faz3_studies[algo] = study
@@ -1727,7 +1761,7 @@ for k in ["n_jobs", "thread_count", "verbosity", "verbose",
 
 sonuc = {
     "_aciklama": {
-        "surum"          : "BioSense AI v3.5 — 4-Faz + Binary F2/F1 + Bootstrap + Klinik",
+        "surum"          : "BioSense AI v3.6 — 4-Faz + Binary F2/F1 + Algo-bazlı bütçe",
         "pipeline"       : [
             "Faz 1: 10 algo geniş tarama + hibrit istatistiksel eleme",
             "Faz 2: Korelasyon + greedy çeşitlilik seçimi → top 3",
@@ -1856,5 +1890,5 @@ print(f"  '{CIKTI_JSON}' kaydedildi.")
 print(f"  '{CIKTI_FAZ1_CSV}' (FAZ 1 tablosu)")
 print(f"  '{CIKTI_KORELASYON_CSV}' (FAZ 2 korelasyon matrisi)")
 print("\n" + "=" * 72)
-print("  BioSense AI v3.5 — TAMAMLANDI")
+print("  BioSense AI v3.6 — TAMAMLANDI")
 print("=" * 72)
