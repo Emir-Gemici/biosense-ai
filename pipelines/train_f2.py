@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  BioSense AI v7.3 — FAZ 1 Fold-Paralel + Feature-Aware (PAH RAM Çökme Fix)            ║
+║  BioSense AI v7.5 — Yarışma-Hazır Trial+Fold (PAH 6h → 15dk)            ║
 ║  Sağlıkta Yapay Zeka Yarışması — Üniversite Kategorisi                      ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║                                                                              ║
@@ -656,19 +656,37 @@ FAZ1_FOLDS     = 5
 # Eski 100 fold std/√100 = std/10 — sadece 1.8x sıkı, ama 3.3x daha yavaş.
 # FAZ 1 amacı eleme; algoritma seçimi 30 fold ile aynı kararı verir.
 FAZ1_TEKRAR    = 6
+# [v7.5] FAZ 1 TRIAL SAYILARI RADIKAL AZALTILDI
+# Sebep: FAZ 1'in AMACI ELEME (top-3 algoritma seçmek), tam tuning DEĞİL.
+# Optuna TPE convergence: 10 random + 20-30 TPE = yeterli sinyal.
+# 50-80+ trial diminishing returns — top-3 seçimi 25 ile aynı oluyor.
+#
+# Eski v7.4 → Yeni v7.5 (per algoritma):
+#   xgboost:       80 → 30   (boosting, kritik aday)
+#   lightgbm:      80 → 30
+#   catboost:      60 → 25   (PAH'da en yavaş — agresif düşür)
+#   random_forest: 50 → 20
+#   extra_trees:   50 → 20
+#   logistic:      40 → 15   (nadiren top-3, kısa)
+#   svm_rbf:       60 → 15
+#   knn:           20 → 10
+#   mlp:           80 → 25
+#
+# PAH ULTRA CatBoost tahmini: 25 × 1.5 = 38 trial × 36 fold paralel / 22 worker
+#   = 38 × ~1.6s = ~60s = 1 dakika (eski 6 saat → 1 dakika, 360x hızlanma)
 FAZ1_TRIAL_PER_ALGO_BASE = {
-    "xgboost":       80,
-    "lightgbm":      80,
-    "catboost":      60,
-    "random_forest": 50,
-    "extra_trees":   50,
-    "logistic":      40,
-    "svm_rbf":       60,
-    "knn":           20,
+    "xgboost":       30,
+    "lightgbm":      30,
+    "catboost":      25,
+    "random_forest": 20,
+    "extra_trees":   20,
+    "logistic":      15,
+    "svm_rbf":       15,
+    "knn":           10,
     "naive_bayes":    5,
-    "mlp":           80,
+    "mlp":           25,
 }
-FAZ1_DB_PREFIX = f"sqlite:///biosense_faz1_v4_{DATA_SUFFIX}"
+FAZ1_DB_PREFIX = f"sqlite:///biosense_faz1_v4_{DATA_SUFFIX}"  # fold ekiyle güncellenecek
 
 FAZ1_F2_ORT_ESIK    = 0.70
 FAZ1_F2_LCB_ESIK    = 0.65
@@ -700,7 +718,7 @@ FAZ3_FOLDS          = 5
 # [v7.4] FAZ3_TEKRAR: 10 → 5 (50 fold → 25 fold)
 # Final scoring için 25 fold yeterli; ULTRA çarpanı 1.2 ile 30 fold olur.
 FAZ3_TEKRAR         = 5
-FAZ3_DB_PREFIX      = f"sqlite:///biosense_faz3_v4_{DATA_SUFFIX}"
+FAZ3_DB_PREFIX      = f"sqlite:///biosense_faz3_v4_{DATA_SUFFIX}"  # fold ekiyle güncellenecek
 FAZ3_TOP_K          = 5
 
 # [v4.9] ─── KULLANICI MOD SEÇİMİ ───
@@ -785,6 +803,13 @@ FAZ3_TRIAL_PER_ALGO = _olcekle(FAZ3_TRIAL_PER_ALGO_BASE, _c["trial"], min_val=50
 FAZ1_TEKRAR = max(5, int(FAZ1_TEKRAR * _c["fold"]))
 FAZ3_TEKRAR = max(3, int(FAZ3_TEKRAR * _c["fold"]))
 FAZ2_TEKRAR_OOF = max(3, int(FAZ2_TEKRAR_OOF * _c["fold"]))
+
+# [v7.4] DB prefix'e fold ekle — eski 100/120-fold DB'lerle karışmasın.
+# Eski cache'ler korunur (biosense_faz1_v4_pah_*.db), yenisi farklı isimde.
+_F1 = FAZ1_FOLDS * FAZ1_TEKRAR
+_F3 = FAZ3_FOLDS * FAZ3_TEKRAR
+FAZ1_DB_PREFIX = f"sqlite:///biosense_faz1_v7_{DATA_SUFFIX}_f{_F1}"
+FAZ3_DB_PREFIX = f"sqlite:///biosense_faz3_v7_{DATA_SUFFIX}_f{_F3}"
 
 # Tahmini süre (KANSER referansı: DEFAULT modda ~25 dk)
 _sure_carpanlari = {"fast": 0.5, "default": 1.0, "ultra": 1.8}
@@ -877,7 +902,7 @@ PREPROCESSING_GEREK = {
 }
 
 print("=" * 72)
-print("  BioSense AI v7.3 — FAZ 1 Fold-Paralel + Feature-Aware + Per-Trial Progress + Cache Hız")
+print("  BioSense AI v7.5 — Yarışma-Hazır Trial+Fold (PAH 6h → 15dk) + Per-Trial Progress + Cache Hız")
 print(f"  Toplam algoritma havuzu: {len(TUM_ALGORITMALAR)}")
 print(f"  FAZ 1: {sum(FAZ1_TRIAL_PER_ALGO.get(a, 30) for a in TUM_ALGORITMALAR)} "
       f"trial × {FAZ1_FOLDS*FAZ1_TEKRAR} fold")
@@ -1925,7 +1950,7 @@ def model_olustur(algo, params, X_tr_sample=None):
 
     elif algo == "mlp":
         p.setdefault("random_state", RASTGELE_TOHUM)
-        p.setdefault("max_iter", 500)
+        p.setdefault("max_iter", 2000)
         p.setdefault("early_stopping", True)
         p.setdefault("validation_fraction", 0.15)
         return Pipeline([("imputer", SimpleImputer(strategy="median")),
@@ -2332,7 +2357,7 @@ def suggest_params(trial, algo, geniş=True):
                 "alpha":              trial.suggest_float("mlp_alpha", 1e-5, 1e-1,
                                                            log=True),
                 "solver":             "lbfgs",
-                "max_iter":           500,
+                "max_iter":           2000,
                 "max_fun":            15000,  # lbfgs'a özgü
                 "random_state":       RASTGELE_TOHUM,
             }
@@ -2349,7 +2374,7 @@ def suggest_params(trial, algo, geniş=True):
                 "batch_size":         trial.suggest_categorical("mlp_bs",
                                                                  [32, 64, "auto"]),
                 "solver":             "adam",
-                "max_iter":           500,
+                "max_iter":           2000,
                 "early_stopping":     True,
                 "validation_fraction": 0.15,
                 "random_state":       RASTGELE_TOHUM,
@@ -4099,7 +4124,7 @@ for k in ["n_jobs", "thread_count", "verbosity", "verbose",
 
 sonuc = {
     "_aciklama": {
-        "surum"          : f"BioSense AI v7.3 — FAZ 1 Fold-Paralel + Feature-Aware + Per-Trial Progress ({DATA_SUFFIX.upper()}, {CALISMA_MODU.upper()})",
+        "surum"          : f"BioSense AI v7.5 — Yarışma-Hazır Trial+Fold (PAH 6h → 15dk) + Per-Trial Progress ({DATA_SUFFIX.upper()}, {CALISMA_MODU.upper()})",
         "calisma_modu"   : CALISMA_MODU,
         "sistem_profili" : {
             "cpu_logical"     : int(_cpu_count_logical),
@@ -4309,5 +4334,5 @@ print(f"     [v5.1] trial_convergence_*.png (3 algoritma için)")
 print(f"     [v5.1] feature_grup_analizi.png (pasta + bar)")
 print(f"     [v5.1] ensemble_shap.png (gerçek karar mantığı)")
 print("\n" + "=" * 72)
-print(f"  BioSense AI v7.3 — TAMAMLANDI ({DATA_SUFFIX.upper()}, MOD: {CALISMA_MODU.upper()})")
+print(f"  BioSense AI v7.5 — TAMAMLANDI ({DATA_SUFFIX.upper()}, MOD: {CALISMA_MODU.upper()})")
 print("=" * 72)
