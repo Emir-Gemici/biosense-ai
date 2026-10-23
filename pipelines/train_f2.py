@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  BioSense AI v7.8 — İmbalanced FAZ2 (MCC+AUC) + Akıllı Metodoloji Tercihi            ║
+║  BioSense AI v7.9 — İmbalanced FAZ2 (MCC+AUC) + Akıllı Metodoloji Tercihi            ║
 ║  Sağlıkta Yapay Zeka Yarışması — Üniversite Kategorisi                      ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║                                                                              ║
@@ -633,8 +633,15 @@ class TrialProgressCallback:
                 eta_str = ""
 
             # Trial sonucu özeti
+            # [v7.9 fix] trial.value imbalanced'da MCC+AUC bileşik SEÇİM SKORU'dur
+            # (F2 değil!). Eskiden "F2=" etiketiyle yazılıyordu → yanıltıcıydı.
+            # Artık seçim skorunu ve gerçek mean F2'yi (user_attr'dan) ayrı gösteriyoruz.
             if state == optuna.trial.TrialState.COMPLETE and trial.value is not None:
-                val_str = f"F2={trial.value:.4f}"
+                _f2_list = trial.user_attrs.get("f2_scores")
+                if _f2_list:
+                    val_str = (f"skor={trial.value:.4f} F2={float(np.mean(_f2_list)):.4f}")
+                else:
+                    val_str = f"skor={trial.value:.4f}"
             elif state == optuna.trial.TrialState.PRUNED:
                 val_str = "PRUNED"
             else:
@@ -642,7 +649,7 @@ class TrialProgressCallback:
 
             print(f"    [{yeni_tamamlanan:>3}/{self.n_hedef}] "
                   f"{self.algo:<13} #{trial.number} → "
-                  f"{val_str:<14} ({gecen:5.0f}s{eta_str})",
+                  f"{val_str:<24} ({gecen:5.0f}s{eta_str})",
                   flush=True)
 
         if self._lock is not None:
@@ -813,10 +820,15 @@ FAZ2_TEKRAR_OOF = max(3, int(FAZ2_TEKRAR_OOF * _c["fold"]))
 
 # [v7.4] DB prefix'e fold ekle — eski 100/120-fold DB'lerle karışmasın.
 # Eski cache'ler korunur (biosense_faz1_v4_pah_*.db), yenisi farklı isimde.
+# [v7.9 KRİTİK] DB prefix'e 'v79' etiketi: v7.9 FAZ1/FAZ3 objective'i değişti
+#   (imbalanced'da F2+AUC → MCC+AUC). Eski v7_ DB'leri farklı objective ile
+#   skorlanmış trial içerir; aynı prefix'le okunursa best-trial seçimi karışık
+#   metrikle yapılır (eski ~0.96 ölçek yeni ~0.71 ölçeği bastırır). Yeni prefix
+#   ile temiz, tutarlı hesaplama; eski v7_ dosyaları silinmeden korunur.
 _F1 = FAZ1_FOLDS * FAZ1_TEKRAR
 _F3 = FAZ3_FOLDS * FAZ3_TEKRAR
-FAZ1_DB_PREFIX = f"sqlite:///biosense_faz1_v7_{DATA_SUFFIX}_f{_F1}"
-FAZ3_DB_PREFIX = f"sqlite:///biosense_faz3_v7_{DATA_SUFFIX}_f{_F3}"
+FAZ1_DB_PREFIX = f"sqlite:///biosense_faz1_v79_{DATA_SUFFIX}_f{_F1}"
+FAZ3_DB_PREFIX = f"sqlite:///biosense_faz3_v79_{DATA_SUFFIX}_f{_F3}"
 
 # Tahmini süre (KANSER referansı: DEFAULT modda ~25 dk)
 _sure_carpanlari = {"fast": 0.5, "default": 1.0, "ultra": 1.8}
@@ -917,7 +929,7 @@ PREPROCESSING_GEREK = {
 }
 
 print("=" * 72)
-print("  BioSense AI v7.8 — İmbalanced FAZ2 (MCC+AUC) + Akıllı Metodoloji Tercihi + Per-Trial Progress + Cache Hız")
+print("  BioSense AI v7.9 — İmbalanced FAZ2 (MCC+AUC) + Akıllı Metodoloji Tercihi + Per-Trial Progress + Cache Hız")
 print(f"  Toplam algoritma havuzu: {len(TUM_ALGORITMALAR)}")
 print(f"  FAZ 1: {sum(FAZ1_TRIAL_PER_ALGO.get(a, 30) for a in TUM_ALGORITMALAR)} "
       f"trial × {FAZ1_FOLDS*FAZ1_TEKRAR} fold")
@@ -1039,6 +1051,7 @@ print(f"  Sınıf dağılımı: {dict(zip(*np.unique(y, return_counts=True)))}")
 # Naive "her şey pozitif" baseline F2'sini hesapla → modelimiz bunu geçmeli.
 _test_pos_orani = float((y_test == 1).sum()) / len(y_test)
 _train_pos_orani = float((y_train == 1).sum()) / len(y_train)
+_imbalanced = (max(_train_pos_orani, 1 - _train_pos_orani) > 0.70)  # [v7.9] erken tanim (FAZ 1/3 objective de gorsun)
 print(f"\n  ── SINIF DAĞILIMI ANALİZİ ──")
 print(f"  Train pozitif oranı: {_train_pos_orani:.3f} ({(y_train==1).sum()}/{len(y_train)})")
 print(f"  Test pozitif oranı : {_test_pos_orani:.3f} ({(y_test==1).sum()}/{len(y_test)})")
@@ -2101,6 +2114,8 @@ def model_fit_universal(algo, params, X_tr, y_tr, X_val=None, y_val=None,
         p.setdefault("random_state", RASTGELE_TOHUM)
         p.setdefault("n_jobs", -1)  # [v6.2] default -1 (inner-parallel)
         p.setdefault("subsample_freq", 1)
+        p.setdefault("deterministic", True)      # [v7.9] cok-thread FP toplama sirasi sabit
+        p.setdefault("force_row_wise", True)     # [v7.9] deterministic ile birlikte gerekli
         if n_jobs_override is not None: p["n_jobs"] = n_jobs_override
         cat_i = kat_idx(X_tr)
         cat_i_safe = cat_i if cat_i else "auto"
@@ -2548,12 +2563,27 @@ def trial_to_model_params(algo, trial_params, n_jobs_override=None):
     if algo == "mlp":
         n_layers   = trial_params.get("mlp_layers", 1)
         layer_size = trial_params.get("mlp_units", 64)
+        hidden     = tuple([layer_size] * n_layers)
+        # [v7.9] suggest_params ile AYNI dal: kucuk data lbfgs, buyuk data adam.
+        # Eski hata: arama lbfgs ile skorlanip final fit adam ile yapiliyordu.
+        kucuk_data = ('N_TRAIN' in globals() and N_TRAIN < 800)
+        if kucuk_data:
+            return {
+                "hidden_layer_sizes":  hidden,
+                "activation":          trial_params.get("mlp_act", "relu"),
+                "alpha":               trial_params.get("mlp_alpha", 1e-4),
+                "solver":              "lbfgs",
+                "max_iter":            500,
+                "max_fun":             15000,
+                "random_state":        RASTGELE_TOHUM,
+            }
         return {
-            "hidden_layer_sizes":  tuple([layer_size] * n_layers),
+            "hidden_layer_sizes":  hidden,
             "activation":          trial_params.get("mlp_act", "relu"),
             "alpha":               trial_params.get("mlp_alpha", 1e-4),
             "learning_rate_init":  trial_params.get("mlp_lri", 1e-3),
             "batch_size":          trial_params.get("mlp_bs", "auto"),
+            "solver":              "adam",
             "max_iter":            500,
             "early_stopping":      True,
             "validation_fraction": 0.15,
@@ -2711,6 +2741,17 @@ else:
 print(f"\n[3/9] FAZ 1: {len(TUM_ALGORITMALAR)} algoritma geniş tarama")
 print("-" * 72)
 
+
+
+def _faz_secim_skoru(f2_list, auc_list, mcc_list, imbalanced):
+    """[v7.9] Imbalanced'da MCC+AUC, dengeli'de F2+AUC (FAZ 2 secimi ile tutarli)."""
+    if imbalanced:
+        return float(np.mean([0.5 * ((m + 1) / 2) + 0.5 * a
+                              for m, a in zip(mcc_list, auc_list)]))
+    return float(np.mean([W_F2 * f + W_AUC * a
+                          for f, a in zip(f2_list, auc_list)]))
+
+
 def _faz1_fold_worker(args):
     """[v7.3] FAZ 1 trial fold worker — module-level (loky picklable).
 
@@ -2736,10 +2777,14 @@ def _faz1_fold_worker(args):
         esik, f2 = en_iyi_f2_esik_grid(y_val, prob, adim=0.01)
         pred = (prob >= esik).astype(int)
         f1 = f1_score(y_val, pred, pos_label=1, average="binary", zero_division=0)
+        try:
+            mcc = matthews_corrcoef(y_val, pred)
+        except Exception:
+            mcc = 0.0
         auc   = roc_auc_score(y_val, prob)
-        return (f2, f1, auc)
+        return (f2, f1, auc, mcc)
     except Exception:
-        return (0.0, 0.0, 0.0)
+        return (0.0, 0.0, 0.0, 0.0)
 
 
 def faz1_objective_factory(algo):
@@ -2792,18 +2837,19 @@ def faz1_objective_factory(algo):
             f2_listesi  = [r[0] for r in results]
             f1_listesi  = [r[1] for r in results]
             auc_listesi = [r[2] for r in results]
+            mcc_listesi = [r[3] for r in results]
 
             # Kullanıcı attr (FAZ 4-A için)
             trial.set_user_attr("f2_scores", f2_listesi)
             trial.set_user_attr("f1_scores", f1_listesi)
-            return float(np.mean([W_F2*f + W_AUC*a
-                                   for f, a in zip(f2_listesi, auc_listesi)]))
+            return _faz_secim_skoru(f2_listesi, auc_listesi, mcc_listesi, _imbalanced)
 
         # ───── KLASİK MOD (outer paralel — KANSER gibi hafif data) ─────
         # Bu mod outer-paralel olduğu için worker'lar zaten paralel → fold sıralı OK
         f2_listesi  = []
         f1_listesi  = []
         auc_listesi = []
+        mcc_listesi = []
         toplam_fold = FAZ1_FOLDS * FAZ1_TEKRAR
         RAPOR_ADIMI = {toplam_fold // 4, toplam_fold // 2, 3 * toplam_fold // 4}
 
@@ -2825,6 +2871,10 @@ def faz1_objective_factory(algo):
                 pred = (prob >= esik).astype(int)
                 f1 = f1_score(y_train[val_idx], pred, pos_label=1,
                               average="binary", zero_division=0)
+                try:
+                    mcc = matthews_corrcoef(y_train[val_idx], pred)
+                except Exception:
+                    mcc = 0.0
                 auc   = roc_auc_score(y_train[val_idx], prob)
             except Exception:
                 return 0.0
@@ -2832,10 +2882,10 @@ def faz1_objective_factory(algo):
             f2_listesi.append(f2)
             f1_listesi.append(f1)
             auc_listesi.append(auc)
+            mcc_listesi.append(mcc)
 
             if fold_no in RAPOR_ADIMI:
-                birlesik = float(np.mean([W_F2*f + W_AUC*a
-                                          for f, a in zip(f2_listesi, auc_listesi)]))
+                birlesik = _faz_secim_skoru(f2_listesi, auc_listesi, mcc_listesi, _imbalanced)
                 try:
                     trial.report(birlesik, step=fold_no)
                     if trial.should_prune(): raise optuna.exceptions.TrialPruned()
@@ -2844,8 +2894,7 @@ def faz1_objective_factory(algo):
 
         trial.set_user_attr("f2_scores", f2_listesi)
         trial.set_user_attr("f1_scores", f1_listesi)
-        return float(np.mean([W_F2*f + W_AUC*a
-                              for f, a in zip(f2_listesi, auc_listesi)]))
+        return _faz_secim_skoru(f2_listesi, auc_listesi, mcc_listesi, _imbalanced)
     return objective
 
 # Her algoritma için ayrı Optuna study çalıştır
@@ -3250,11 +3299,16 @@ def _faz3_fold_worker(args):
                                     X_fold_es, y_fold_es,
                                     n_jobs_override=1)
         prob = predict_proba_universal(m, algo, X_val)
-        _, f2 = en_iyi_f2_esik_grid(y_val, prob, adim=0.005)
+        esik, f2 = en_iyi_f2_esik_grid(y_val, prob, adim=0.005)
+        pred = (prob >= esik).astype(int)
+        try:
+            mcc = matthews_corrcoef(y_val, pred)
+        except Exception:
+            mcc = 0.0
         auc   = roc_auc_score(y_val, prob)
-        return (f2, auc)
+        return (f2, auc, mcc)
     except Exception:
-        return (0.0, 0.0)
+        return (0.0, 0.0, 0.0)
 
 
 def faz3_objective_factory(algo):
@@ -3297,9 +3351,9 @@ def faz3_objective_factory(algo):
 
         f2_listesi  = [r[0] for r in results]
         auc_listesi = [r[1] for r in results]
+        mcc_listesi = [r[2] for r in results]
 
-        return float(np.mean([W_F2*f + W_AUC*a
-                              for f, a in zip(f2_listesi, auc_listesi)]))
+        return _faz_secim_skoru(f2_listesi, auc_listesi, mcc_listesi, _imbalanced)
     return objective
 
 # Her algoritma için ayrı study
@@ -3998,7 +4052,8 @@ def _solo_evaluate(model_adi, fit_fn, predict_fn):
     try:
         model = fit_fn()
         train_probs = predict_fn(model, X_train)
-        esik = en_iyi_f2_esik_train(y_train, train_probs)
+        esik, _ = en_iyi_f2_esik_benzersiz(y_train, train_probs,
+                                           mcc_oncelikli=_imbalanced)  # [v7.9] ensemble ile ayni rutin
         test_probs = predict_fn(model, X_test)
         test_pred  = (test_probs >= esik).astype(int)
 
@@ -4096,6 +4151,7 @@ def _solo_fit_lgb():
         colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0,
         scale_pos_weight=SPW, random_state=RASTGELE_TOHUM,
         n_jobs=-1, verbosity=-1, subsample_freq=1,
+        deterministic=True, force_row_wise=True,   # [v7.9] determinizm
     )
     m.fit(X_train, y_train, categorical_feature=kat_idx(X_train))
     return m
@@ -4330,7 +4386,7 @@ for k in ["n_jobs", "thread_count", "verbosity", "verbose",
 
 sonuc = {
     "_aciklama": {
-        "surum"          : f"BioSense AI v7.8 — İmbalanced FAZ2 (MCC+AUC) + Akıllı Metodoloji Tercihi + Per-Trial Progress ({DATA_SUFFIX.upper()}, {CALISMA_MODU.upper()})",
+        "surum"          : f"BioSense AI v7.9 — İmbalanced FAZ2 (MCC+AUC) + Akıllı Metodoloji Tercihi + Per-Trial Progress ({DATA_SUFFIX.upper()}, {CALISMA_MODU.upper()})",
         "calisma_modu"   : CALISMA_MODU,
         "sistem_profili" : {
             "cpu_logical"     : int(_cpu_count_logical),
@@ -4516,6 +4572,12 @@ sonuc = {
         "toplam_ozellik"     : int(len(OZELLIK)),
         "kalan_ozellik"      : int(len(X_train.columns)),
         "budanan_ozellik"    : int(len(BUDANAN_OZELLIKLER)),
+        # [v7.9] SHAP-seçili özellik listesi — test arayüzü (biosense_test_arayuzu.py)
+        # aynı özellik setiyle eğitsin diye. Yoksa arayüz tüm özelliklerle eğitir,
+        # v7.9 parametreleri (bu alt-küme için ayarlı) uyumsuz kalır.
+        "secilen_ozellikler" : list(map(str, X_train.columns)),
+        "kategorik_kolonlar" : list(map(str, KAT_KOLONLAR)),
+        "label_pozitif_sinif": str(le.classes_[1]),
     },
 }
 
@@ -4540,5 +4602,5 @@ print(f"     [v5.1] trial_convergence_*.png (3 algoritma için)")
 print(f"     [v5.1] feature_grup_analizi.png (pasta + bar)")
 print(f"     [v5.1] ensemble_shap.png (gerçek karar mantığı)")
 print("\n" + "=" * 72)
-print(f"  BioSense AI v7.8 — TAMAMLANDI ({DATA_SUFFIX.upper()}, MOD: {CALISMA_MODU.upper()})")
+print(f"  BioSense AI v7.9 — TAMAMLANDI ({DATA_SUFFIX.upper()}, MOD: {CALISMA_MODU.upper()})")
 print("=" * 72)
