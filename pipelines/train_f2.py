@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  BioSense AI v3.3 — 4-FAZ HİYERARŞİK ALGORİTMA SEÇİMİ                       ║
+║  BioSense AI v3.5 — 4-FAZ HİYERARŞİK ALGORİTMA SEÇİMİ                       ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  FAZ 1: 10 algoritma geniş tarama (5×20=100 fold)                            ║
 ║         Hibrit eleme: F2_ort<0.70 + (F2_ort-0.5×std)<0.65 + Welch p<0.05     ║
@@ -32,6 +32,21 @@
 ║      KAÇIRILAN patojenik sayısı (false negative = klinik risk)              ║
 ║      Yanlış alarm sayısı (false positive = gereksiz takip)                  ║
 ║                                                                              ║
+║  v3.3 → v3.4 DÜZELTMELERİ (Run çıktısı ortaya çıkardı):                     ║
+║   ✓ FIX H: CatBoost duplicate verbose=False kaldırıldı (TypeError önlendi)  ║
+║      + bootstrap_type="Bernoulli" → subsample desteği sağlandı              ║
+║   ✓ FIX I: SimpleImputer non-tree pipeline'lara eklendi                     ║
+║      LR/SVM/kNN/NB/MLP artık NaN içeren veriyle çalışabiliyor               ║
+║   ✓ FIX J: SHAP budama top-K mantığına geçti (yüzdelik karşılaştırma değil) ║
+║      Çok sayıda sıfır SHAP değeri olunca da garanti %20 budama              ║
+║                                                                              ║
+║  v3.4 → v3.5 METRİK DÜZELTMESİ (Klinik Uyum):                               ║
+║   ✓ weighted F2/F1 → binary F2/F1 (pos_label=1, sadece patojenik sınıfı)    ║
+║      Klinik amaç (patojenik yakalama) ile metrik birebir uyumlu             ║
+║      Optuna objective, eşik optimizasyonu, test raporlama hepsi binary'de   ║
+║   ✓ FAZ 1 tablosuna F1_ort sütunu eklendi (sadece raporlama amaçlı)         ║
+║      Eleme ve seçim hâlâ F2 ile, F1 jüri kıyaslaması için durur             ║
+║                                                                              ║
 ║  v2.8'in tüm FIX #1-#20 düzeltmeleri korundu.                                ║
 ║  10 algoritma: 3 boosting + 2 bagging + 1 linear + 1 kernel + 1 instance-    ║
 ║  based + 1 probabilistic + 1 neural → 7 paradigma kapsanır                   ║
@@ -39,12 +54,25 @@
 """
 
 import os, sys, json, time, warnings, gc
+
+# [FIX K] Windows CMD/PowerShell default encoding cp1254 (Türkçe) bazı
+# Unicode karakterleri (→, ★, ✓, █, üç noktalı tireler) yazdıramaz.
+# Output redirect (> log.txt) durumunda UnicodeEncodeError fırlar.
+# Bu satırlar stdout/stderr'i UTF-8'e zorlar — kod platformdan bağımsız çalışır.
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import numpy as np
 import pandas as pd
 import xgboost as xgb
 import optuna
 from sklearn.model_selection import train_test_split, RepeatedStratifiedKFold
 from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
@@ -189,7 +217,7 @@ PREPROCESSING_GEREK = {
 }
 
 print("=" * 72)
-print("  BioSense AI v3.3 — 4-FAZ HİYERARŞİK (FIX A-G + Bootstrap + Klinik)")
+print("  BioSense AI v3.5 — 4-FAZ HİYERARŞİK (binary F2 + F1 kıyas)")
 print(f"  Toplam algoritma havuzu: {len(TUM_ALGORITMALAR)}")
 print(f"  FAZ 1: {sum(FAZ1_TRIAL_PER_ALGO.get(a, 30) for a in TUM_ALGORITMALAR)} "
       f"trial × {FAZ1_FOLDS*FAZ1_TEKRAR} fold")
@@ -234,7 +262,11 @@ KAT_KOLONLAR = []
 for col in X.columns:
     if (X[col].dtype == "object" or X[col].dtype.name == "category"
             or str(col).startswith("CAT_") or str(col).startswith("AA_")):
-        X[col] = X[col].astype(str).astype("category")
+        
+        # [FIX CatBoost NaN] Boşluklar float (NaN) olarak kalmasın, 
+        # CatBoost'un okuyabileceği "EKSİK" stringine dönüşsün!
+        X[col] = X[col].fillna("EKSİK").astype(str).astype("category")
+        
         KAT_KOLONLAR.append(col)
 
 X_train, X_test, y_train, y_test = train_test_split(
@@ -261,7 +293,8 @@ def get_algo(t):
     return t.user_attrs.get("algo", t.params.get("algorithm", "xgboost"))
 
 def en_iyi_f2_esik_benzersiz(y_gercek, problar):
-    """v2.8 FIX #17: filtre boşsa orijinal prob dağılımına geri dön."""
+    """v2.8 FIX #17: filtre boşsa orijinal prob dağılımına geri dön.
+    v3.5: average='binary' (pos_label=1) — klinik amaçla uyumlu."""
     adaylar = np.unique(problar)
     adaylar_dar = adaylar[(adaylar > 0.01) & (adaylar < 0.99)]
     adaylar = adaylar_dar if len(adaylar_dar) > 0 else adaylar
@@ -271,18 +304,21 @@ def en_iyi_f2_esik_benzersiz(y_gercek, problar):
     esik_sonuc = 0.50
     for e in adaylar:
         f2 = fbeta_score(y_gercek, (problar >= e).astype(int),
-                         beta=2, average="weighted", zero_division=0)
+                         beta=2, pos_label=1, average="binary",
+                         zero_division=0)
         if f2 > en_iyi_f2:
             en_iyi_f2  = f2
             esik_sonuc = float(e)
     return round(esik_sonuc, 5), round(en_iyi_f2, 6)
 
 def en_iyi_f2_esik_grid(y_gercek, problar, adim=0.005):
+    """v3.5: average='binary' (pos_label=1)."""
     en_iyi_f2  = 0.0
     esik_sonuc = 0.50
     for e in np.arange(0.05, 0.95 + adim, adim):
         f2 = fbeta_score(y_gercek, (problar >= e).astype(int),
-                         beta=2, average="weighted", zero_division=0)
+                         beta=2, pos_label=1, average="binary",
+                         zero_division=0)
         if f2 > en_iyi_f2:
             en_iyi_f2  = f2
             esik_sonuc = round(float(e), 4)
@@ -400,6 +436,7 @@ def model_olustur(algo, params, X_tr_sample=None):
     elif algo == "catboost":
         p.setdefault("random_seed", RASTGELE_TOHUM)
         p.setdefault("verbose", False)
+        p.setdefault("bootstrap_type", "Bernoulli")
         return CatBoostClassifier(**p)
 
     elif algo == "random_forest":
@@ -413,23 +450,29 @@ def model_olustur(algo, params, X_tr_sample=None):
     elif algo == "logistic":
         p.setdefault("random_state", RASTGELE_TOHUM)
         p.setdefault("max_iter", 2000)
-        # Non-tree → StandardScaler + LogisticRegression
-        return Pipeline([("scaler", StandardScaler()),
+        # [FIX I] SimpleImputer eklendi — sklearn LR NaN'ı kaldıramaz.
+        # Genomik verilerde sıkça eksik değer olur; median ile dolduruyoruz.
+        # Fold içinde fit ediliyor → veri sızıntısı yok.
+        return Pipeline([("imputer", SimpleImputer(strategy="median")),
+                         ("scaler", StandardScaler()),
                          ("clf", LogisticRegression(**p))])
 
     elif algo == "svm_rbf":
         p.setdefault("random_state", RASTGELE_TOHUM)
         p.setdefault("probability", True)
         p.setdefault("kernel", "rbf")
-        return Pipeline([("scaler", StandardScaler()),
+        return Pipeline([("imputer", SimpleImputer(strategy="median")),
+                         ("scaler", StandardScaler()),
                          ("clf", SVC(**p))])
 
     elif algo == "knn":
-        return Pipeline([("scaler", StandardScaler()),
+        return Pipeline([("imputer", SimpleImputer(strategy="median")),
+                         ("scaler", StandardScaler()),
                          ("clf", KNeighborsClassifier(**p))])
 
     elif algo == "naive_bayes":
-        return Pipeline([("scaler", StandardScaler()),
+        return Pipeline([("imputer", SimpleImputer(strategy="median")),
+                         ("scaler", StandardScaler()),
                          ("clf", GaussianNB(**p))])
 
     elif algo == "mlp":
@@ -437,7 +480,8 @@ def model_olustur(algo, params, X_tr_sample=None):
         p.setdefault("max_iter", 500)
         p.setdefault("early_stopping", True)
         p.setdefault("validation_fraction", 0.15)
-        return Pipeline([("scaler", StandardScaler()),
+        return Pipeline([("imputer", SimpleImputer(strategy="median")),
+                         ("scaler", StandardScaler()),
                          ("clf", MLPClassifier(**p))])
     else:
         raise ValueError(f"Bilinmeyen algoritma: {algo}")
@@ -498,15 +542,20 @@ def model_fit_universal(algo, params, X_tr, y_tr, X_val=None, y_val=None,
         p.setdefault("random_seed", RASTGELE_TOHUM)
         p.setdefault("verbose", False)
         p.setdefault("thread_count", 1)
+        # [FIX H] Yeni CatBoost: default bootstrap_type=Bayesian subsample'ı kabul
+        # etmez. Bernoulli klasik subsample desteklemeli.
+        p.setdefault("bootstrap_type", "Bernoulli")
         if n_jobs_override: p["thread_count"] = n_jobs_override
         cat_i = kat_idx(X_tr)
         cat_i_safe = cat_i if cat_i else None
         if use_es:
+            # [FIX H] verbose=False zaten p içinde → constructor'a tekrar
+            # eklemek "got multiple values for 'verbose'" TypeError üretiyordu.
             m = CatBoostClassifier(**p, early_stopping_rounds=EARLY_STOP_ROUNDS,
-                                   cat_features=cat_i_safe, verbose=False)
+                                   cat_features=cat_i_safe)
             m.fit(X_tr, y_tr, eval_set=(X_val, y_val))
         else:
-            m = CatBoostClassifier(**p, cat_features=cat_i_safe, verbose=False)
+            m = CatBoostClassifier(**p, cat_features=cat_i_safe)
             m.fit(X_tr, y_tr)
         return m
 
@@ -812,7 +861,8 @@ def trial_to_model_params(algo, trial_params, n_jobs_override=None):
                   "n_jobs": n_jobs_override if n_jobs_override else 1})
     elif algo == "catboost":
         p.update({"random_seed": RASTGELE_TOHUM, "verbose": False,
-                  "thread_count": n_jobs_override if n_jobs_override else 1})
+                  "thread_count": n_jobs_override if n_jobs_override else 1,
+                  "bootstrap_type": "Bernoulli"})
     elif algo == "random_forest":
         p.update({"random_state": RASTGELE_TOHUM,
                   "n_jobs": n_jobs_override if n_jobs_override else 1})
@@ -862,8 +912,14 @@ if SHAP_OK and SHAP_PERCENTILE > 0:
             bar = "█" * int(mean_abs_shap[rk] / shap_max * 35)
             print(f"    {all_cols[rk]:<30} {bar}  {mean_abs_shap[rk]:.5f}")
 
-        shap_esik  = np.percentile(mean_abs_shap, SHAP_PERCENTILE)
-        kalan_mask = mean_abs_shap >= shap_esik
+        # [FIX J] Yüzdelik temelli ">=" karşılaştırması: çok sayıda özellik
+        # aynı SHAP değerine sahipse (örn. çoğu 0.0) yüzdelik 0.0'a düşer ve
+        # tüm özellikler tutulur. Top-K ile garanti %20 budama.
+        n_kalan = max(1, int(len(mean_abs_shap) * (1 - SHAP_PERCENTILE / 100)))
+        top_idx = np.argsort(mean_abs_shap)[::-1][:n_kalan]
+        kalan_mask = np.zeros(len(mean_abs_shap), dtype=bool)
+        kalan_mask[top_idx] = True
+        shap_esik  = float(mean_abs_shap[top_idx[-1]])  # gerçek alt eşik
         kalan_cols = [c for c, keep in zip(all_cols, kalan_mask) if keep]
         budanan_cnt = len(all_cols) - len(kalan_cols)
 
@@ -896,6 +952,7 @@ def faz1_objective_factory(algo):
         rskf = RepeatedStratifiedKFold(n_splits=FAZ1_FOLDS, n_repeats=FAZ1_TEKRAR,
                                        random_state=RASTGELE_TOHUM)
         f2_listesi  = []
+        f1_listesi  = []   # v3.5: sadece tabloda raporlamak için (eleme/seçim DEĞİL)
         auc_listesi = []
         # Pruner için ara rapor adımları
         toplam_fold = FAZ1_FOLDS * FAZ1_TEKRAR
@@ -916,12 +973,17 @@ def faz1_objective_factory(algo):
                 m    = model_fit_universal(algo, params, X_fold_tr, y_fold_tr,
                                             X_fold_es, y_fold_es)
                 prob = predict_proba_universal(m, algo, X_train.iloc[val_idx])
-                _, f2 = en_iyi_f2_esik_grid(y_train[val_idx], prob, adim=0.01)
+                esik, f2 = en_iyi_f2_esik_grid(y_train[val_idx], prob, adim=0.01)
+                # Aynı eşikte F1'i de hesapla (sadece tablo için)
+                pred = (prob >= esik).astype(int)
+                f1 = f1_score(y_train[val_idx], pred, pos_label=1,
+                              average="binary", zero_division=0)
                 auc   = roc_auc_score(y_train[val_idx], prob)
             except Exception:
                 return 0.0
 
             f2_listesi.append(f2)
+            f1_listesi.append(f1)
             auc_listesi.append(auc)
 
             if fold_no in RAPOR_ADIMI:
@@ -933,8 +995,9 @@ def faz1_objective_factory(algo):
                 except optuna.exceptions.TrialPruned: raise
                 except Exception: pass
 
-        # Trial'a fold-bazlı F2 skorlarını user_attr olarak kaydet (eleme için)
+        # Trial'a fold-bazlı F2 + F1 skorlarını user_attr olarak kaydet
         trial.set_user_attr("f2_scores", f2_listesi)
+        trial.set_user_attr("f1_scores", f1_listesi)   # v3.5: tablo için
         return float(np.mean([W_F2*f + W_AUC*a
                               for f, a in zip(f2_listesi, auc_listesi)]))
     return objective
@@ -997,14 +1060,19 @@ for algo in TUM_ALGORITMALAR:
         continue
 
     f2_scores = best_t.user_attrs.get("f2_scores", [])
+    f1_scores = best_t.user_attrs.get("f1_scores", [])  # v3.5: tablo için
     if not f2_scores:
         # user_attr kayıp olabilir; baz veri ile doldur
         f2_scores = [best_t.value]
+    if not f1_scores:
+        f1_scores = [0.0]
 
     faz1_sonuclari[algo] = {
         "mean_f2":     float(np.mean(f2_scores)),
         "std_f2":      float(np.std(f2_scores)),
         "lcb_f2":      float(np.mean(f2_scores) - 0.5 * np.std(f2_scores)),
+        "mean_f1":     float(np.mean(f1_scores)),   # v3.5: kıyas için
+        "std_f1":      float(np.std(f1_scores)),
         "best_score":  float(best_t.value),
         "scores":      f2_scores,
         "best_params": dict(best_t.params),
@@ -1012,7 +1080,8 @@ for algo in TUM_ALGORITMALAR:
     }
 
     print(f"    Sonuç: mean F2={np.mean(f2_scores):.4f}  std={np.std(f2_scores):.4f}"
-          f"  LCB={np.mean(f2_scores)-0.5*np.std(f2_scores):.4f}")
+          f"  LCB={np.mean(f2_scores)-0.5*np.std(f2_scores):.4f}"
+          f"  | F1={np.mean(f1_scores):.4f}")
 
 # ── FAZ 1 ELEME: Hibrit Üçlü Kriter ───────────────────────────────
 print("\n  ── FAZ 1 ELEME (Hibrit Üçlü Kriter) ────────────────────────")
@@ -1044,7 +1113,13 @@ for algo, sonuc in faz1_sonuclari.items():
 
     kriter1 = mean_f2 < FAZ1_F2_ORT_ESIK
     kriter2 = lcb_f2  < FAZ1_F2_LCB_ESIK
-    kriter3 = t_pval  < FAZ1_TTEST_P_ESIK
+    # [FIX L] NaN p_value = sabit tahmin / crash. Python'da nan < 0.05 = False
+    # döner, bu nedenle kriter3 yanlışlıkla False çıkar ve crash olan algo
+    # "GEÇTİ" gösterilir. NaN'ı "anlamlı şekilde farklı" sayalım.
+    if np.isnan(t_pval):
+        kriter3 = True
+    else:
+        kriter3 = t_pval < FAZ1_TTEST_P_ESIK
 
     elendi = kriter1 and kriter2 and kriter3
     durum  = "ELENDİ" if elendi else "GEÇTİ"
@@ -1054,19 +1129,21 @@ for algo, sonuc in faz1_sonuclari.items():
 
     eleme_raporu.append({
         "algo": algo, "mean_f2": mean_f2, "std_f2": sonuc["std_f2"],
-        "lcb_f2": lcb_f2, "t_pval": t_pval, "durum": durum,
+        "lcb_f2": lcb_f2, "mean_f1": sonuc.get("mean_f1", 0.0),
+        "t_pval": t_pval, "durum": durum,
     })
 
     if not elendi:
         hayatta_kalan.append(algo)
 
-# Eleme tablosunu yazdır
+# Eleme tablosunu yazdır (F1 sadece kıyaslama için, eleme F2 ile)
 print(f"\n  {'Algoritma':<14}  {'F2_ort':>8}  {'F2_std':>8}  "
-      f"{'LCB':>8}  {'p_value':>8}  {'Durum':>8}")
-print(f"  {'-'*14}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}")
+      f"{'LCB':>8}  {'F1_ort':>8}  {'p_value':>8}  {'Durum':>8}")
+print(f"  {'-'*14}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}")
 for r in sorted(eleme_raporu, key=lambda x: x["mean_f2"], reverse=True):
     print(f"  {r['algo']:<14}  {r['mean_f2']:>8.4f}  {r['std_f2']:>8.4f}  "
-          f"{r['lcb_f2']:>8.4f}  {r['t_pval']:>8.4f}  {r['durum']:>8}")
+          f"{r['lcb_f2']:>8.4f}  {r['mean_f1']:>8.4f}  "
+          f"{r['t_pval']:>8.4f}  {r['durum']:>8}")
 
 print(f"\n  Hayatta kalan: {len(hayatta_kalan)} algoritma → {hayatta_kalan}")
 
@@ -1419,7 +1496,8 @@ kalibre_oof_proba    = iso_reg.predict(ensemble_oof_proba)
 OPTIMAL_ESIK, oof_f2 = en_iyi_f2_esik_benzersiz(y_train, kalibre_oof_proba)
 
 oof_tahminler = (kalibre_oof_proba >= OPTIMAL_ESIK).astype(int)
-oof_f1        = f1_score(y_train, oof_tahminler, average="weighted", zero_division=0)
+oof_f1        = f1_score(y_train, oof_tahminler, pos_label=1,
+                          average="binary", zero_division=0)
 try:
     oof_auc = roc_auc_score(y_train, kalibre_oof_proba)
 except ValueError:
@@ -1488,11 +1566,12 @@ else:
 
 final_test_proba = iso_reg.predict(final_raw)
 
-# Test metrikleri
+# Test metrikleri (v3.5: binary, pos_label=1)
 test_tahminler = (final_test_proba >= OPTIMAL_ESIK).astype(int)
 test_f2        = fbeta_score(y_test, test_tahminler, beta=2,
-                              average="weighted", zero_division=0)
-test_f1        = f1_score(y_test, test_tahminler, average="weighted", zero_division=0)
+                              pos_label=1, average="binary", zero_division=0)
+test_f1        = f1_score(y_test, test_tahminler, pos_label=1,
+                           average="binary", zero_division=0)
 try:
     test_auc = roc_auc_score(y_test, final_test_proba)
 except ValueError:
@@ -1513,12 +1592,14 @@ else:
 print("\n  Bootstrap 95% Güven Aralıkları (2000 iterasyon)...")
 _, test_f2_lo, test_f2_hi = bootstrap_metric_ci(
     y_test, final_test_proba,
-    lambda yt, yp: fbeta_score(yt, yp, beta=2, average="weighted", zero_division=0),
+    lambda yt, yp: fbeta_score(yt, yp, beta=2, pos_label=1,
+                                average="binary", zero_division=0),
     threshold=OPTIMAL_ESIK,
 )
 _, test_f1_lo, test_f1_hi = bootstrap_metric_ci(
     y_test, final_test_proba,
-    lambda yt, yp: f1_score(yt, yp, average="weighted", zero_division=0),
+    lambda yt, yp: f1_score(yt, yp, pos_label=1, average="binary",
+                             zero_division=0),
     threshold=OPTIMAL_ESIK,
 )
 try:
@@ -1551,12 +1632,12 @@ toplam_benign    = int((y_test == 0).sum())
 print("\n" + "=" * 72)
 print("  GERÇEK TEST SONUÇLARI  (X_test ilk ve tek kez)")
 print("=" * 72)
-print(f"  F2 (weighted) : {test_f2:.4f}  [95% CI: {test_f2_lo:.4f}-{test_f2_hi:.4f}]  ←─ Ana Metrik")
-print(f"  F1 (weighted) : {test_f1:.4f}  [95% CI: {test_f1_lo:.4f}-{test_f1_hi:.4f}]")
-print(f"  AUC           : {test_auc:.4f}  [95% CI: {test_auc_lo:.4f}-{test_auc_hi:.4f}]")
-print(f"  MCC           : {test_mcc:.4f}")
-print(f"  Doğruluk      : %{test_acc*100:.2f}")
-print(f"  Eşik          : {OPTIMAL_ESIK:.5f}")
+print(f"  F2 (binary, pos=patojenik) : {test_f2:.4f}  [95% CI: {test_f2_lo:.4f}-{test_f2_hi:.4f}]  ←─ Ana Metrik")
+print(f"  F1 (binary, pos=patojenik) : {test_f1:.4f}  [95% CI: {test_f1_lo:.4f}-{test_f1_hi:.4f}]")
+print(f"  AUC                        : {test_auc:.4f}  [95% CI: {test_auc_lo:.4f}-{test_auc_hi:.4f}]")
+print(f"  MCC                        : {test_mcc:.4f}")
+print(f"  Doğruluk                   : %{test_acc*100:.2f}")
+print(f"  Eşik                       : {OPTIMAL_ESIK:.5f}")
 print("─" * 72)
 print(f"  KLİNİK YORUMLAMA (Pozitif sınıf = Patojenik):")
 print(f"    Patojenik Recall    : {test_recall_path:.4f}  "
@@ -1596,6 +1677,7 @@ for algo in TUM_ALGORITMALAR:
         "faz1_f2_ort":   round(s["mean_f2"], 4),
         "faz1_f2_std":   round(s["std_f2"], 4),
         "faz1_lcb":      round(s["lcb_f2"], 4),
+        "faz1_f1_ort":   round(s.get("mean_f1", 0.0), 4),   # v3.5: kıyas için
         "faz1_p_value":  round(s.get("t_pval", 1.0), 4),
         "faz1_durum":    durum,
         "faz3_cv_skor":  faz3_skor,
@@ -1606,14 +1688,15 @@ for algo in TUM_ALGORITMALAR:
 juri_tablosu_sirali = sorted(juri_tablosu, key=lambda x: x["faz1_f2_ort"], reverse=True)
 
 print(f"\n  {'Algoritma':<14} {'Paradigma':<28} "
-      f"{'F2_ort':>7} {'F2_std':>7} {'LCB':>7} {'p_val':>6} "
+      f"{'F2_ort':>7} {'F2_std':>7} {'LCB':>7} {'F1_ort':>7} {'p_val':>6} "
       f"{'Faz3':>7} {'Sonuç':>10}")
-print(f"  {'-'*14} {'-'*28} {'-'*7} {'-'*7} {'-'*7} {'-'*6} {'-'*7} {'-'*10}")
+print(f"  {'-'*14} {'-'*28} {'-'*7} {'-'*7} {'-'*7} {'-'*7} {'-'*6} {'-'*7} {'-'*10}")
 for r in juri_tablosu_sirali:
     faz3_str = f"{r['faz3_cv_skor']:.4f}" if r['faz3_cv_skor'] is not None else "  -  "
     print(f"  {r['algoritma']:<14} {r['paradigma']:<28} "
           f"{r['faz1_f2_ort']:>7.4f} {r['faz1_f2_std']:>7.4f} "
-          f"{r['faz1_lcb']:>7.4f} {r['faz1_p_value']:>6.4f} "
+          f"{r['faz1_lcb']:>7.4f} {r['faz1_f1_ort']:>7.4f} "
+          f"{r['faz1_p_value']:>6.4f} "
           f"{faz3_str:>7} {r['ensemble']:>10}")
 
 # Korelasyon matrisi yazdır
@@ -1644,7 +1727,7 @@ for k in ["n_jobs", "thread_count", "verbosity", "verbose",
 
 sonuc = {
     "_aciklama": {
-        "surum"          : "BioSense AI v3.3 — 4-Faz Hiyerarşik + Bootstrap CI + Klinik",
+        "surum"          : "BioSense AI v3.5 — 4-Faz + Binary F2/F1 + Bootstrap + Klinik",
         "pipeline"       : [
             "Faz 1: 10 algo geniş tarama + hibrit istatistiksel eleme",
             "Faz 2: Korelasyon + greedy çeşitlilik seçimi → top 3",
@@ -1773,5 +1856,5 @@ print(f"  '{CIKTI_JSON}' kaydedildi.")
 print(f"  '{CIKTI_FAZ1_CSV}' (FAZ 1 tablosu)")
 print(f"  '{CIKTI_KORELASYON_CSV}' (FAZ 2 korelasyon matrisi)")
 print("\n" + "=" * 72)
-print("  BioSense AI v3.3 — TAMAMLANDI")
+print("  BioSense AI v3.5 — TAMAMLANDI")
 print("=" * 72)
