@@ -1,100 +1,53 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  BioSense AI v4.3 — ÇOKLU VERİ SETİ DESTEĞİ + Performans Cache              ║
+║  BioSense AI v5.1 — TEKNOFEST Variant Patojenite Tahmini                    ║
+║  Sağlıkta Yapay Zeka Yarışması — Üniversite Kategorisi                      ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  v4.2 → v4.3 EKLEMESİ:                                                       ║
-║   ✓ DATA_SUFFIX argümanı: python script.py kanser / cftr / pah / master     ║
-║   ✓ Tüm dosya isimleri suffix'li (JSON, DB, CSV, görsel klasörü)            ║
-║      → 4 veri seti karışmadan paralel çalışabilir                           ║
-║   ✓ multiprocessing.cpu_count() ile dinamik PARALEL_ISCI                    ║
-║      → 16/24/32 core'lu makinelerde otomatik uyum                           ║
-║   ✓ Bootstrap iter sayısı dinamik (test boyutuna göre 800-2000)             ║
-║   ✓ Solo modellerin probs cache → görsel üretiminde reuse (~5 dk tasarruf)  ║
 ║                                                                              ║
-╠══════════════════════════════════════════════════════════════════════════════╣
-║  v4.1 → v4.2 DÜZELTMESİ — CPU verim sorunu çözüldü:                         ║
-║   ✓ FIX O: Algoritmaya göre paralellik stratejisi                           ║
-║      - C++ boosting (XGB/LGB/CB): Optuna 24 paralel, model n_jobs=1         ║
-║      - sklearn tree (RF/ET): Optuna 1 sequential, model n_jobs=-1           ║
-║        Tek model fit ~30s → iç paralelizmle ~2s, dış sequential, GIL temiz  ║
-║      - Diğer sklearn (LR/SVM/kNN/NB/MLP): Optuna 24 paralel, model 1        ║
-║      Net etki: RF/ET fazlarında CPU %100, tahmini hızlanma 3-5x             ║
+║  ─── v5.0 → v5.1 EKLEMESİ (Jüri Etkisi İçin 4 Yeni Görsel) ───              ║
+║   ✓ Trial Convergence: Her FAZ 3 algoritması için Optuna progress eğrisi    ║
+║     → "Sistematik araştırma" kanıtı                                          ║
+║   ✓ Pipeline Funnel: 4-faz hiyerarşik mimari görseli                        ║
+║     → Word SmartArt yerine otomatik üretiliyor                              ║
+║   ✓ Feature Group Analysis: Prefix bazlı SHAP dağılımı (pasta + bar)        ║
+║     → "Hangi özellik grubu kararı yönlendiriyor?"                            ║
+║   ✓ Final Ensemble SHAP: 5 tree üyesinin ortalama SHAP'i                    ║
+║     → Referans modelin değil, gerçek karar mantığı                          ║
 ║                                                                              ║
-╠══════════════════════════════════════════════════════════════════════════════╣
-║  v4.0 → v4.1 EKLEMESİ — TEKNOFEST ŞARTNAMESİ TAM UYUMU:                     ║
-║   ✓ PR-AUC (average_precision_score) eklendi — ZORUNLU metrik               ║
-║      Hem OOF hem test için bootstrap %95 CI ile                             ║
-║   ✓ Karar eşiği tablosu — 13 farklı eşikte (0.10-0.70) tüm metrikler        ║
-║      "Farklı karar eşiklerinin test sonuçları" şartı karşılandı             ║
-║   ✓ 8 adet PNG görsel otomatik üretilir (grafikler/ klasörü):              ║
-║      - SHAP top 15 özellik (açıklanabilirlik)                              ║
-║      - FAZ 1 algoritma karşılaştırma bar chart                             ║
-║      - FAZ 2 korelasyon heatmap                                             ║
-║      - Confusion matrix (ensemble + top 3 solo, klinik etiketli)           ║
-║      - Solo vs Ensemble F2 bar (CI'lı)                                      ║
-║      - ROC + Precision-Recall eğri karşılaştırması                          ║
+║  ─── KULLANIM ───                                                           ║
+║  python script.py <veri_seti> [mod]                                         ║
+║    veri_seti : kanser | cftr | pah | master                                  ║
+║    mod       : fast | default | ultra  (opsiyonel — sorulur)                ║
 ║                                                                              ║
-║  ── 4 FAZ PIPELINE (değişmedi) ────────────────────────────────────────────  ║
-╠══════════════════════════════════════════════════════════════════════════════╣
-║  FAZ 1: 10 algoritma geniş tarama (5×20=100 fold)                            ║
-║         Hibrit eleme: F2_ort<0.70 + (F2_ort-0.5×std)<0.65 + Welch p<0.05     ║
-║  FAZ 2: Hayatta kalanlar arasında korelasyon + çeşitlilik seçimi → top 3     ║
-║         Greedy: en yüksek F2 → en düşük ort. korelasyona ekle                ║
-║  FAZ 3: Seçilen 3 algoritmanın her birini Optuna ile derin tunela            ║
-║         Her algo: ~1500 trial, 5×10=50 fold, TPE multivariate                ║
-║  FAZ 4: Ensemble (top-5×3=15 üye) + isotonic kalibrasyon + test              ║
+║  Örnek: python script.py kanser ultra                                       ║
 ║                                                                              ║
-║  v3.0 → v3.1 DÜZELTMELERİ:                                                   ║
-║   ✓ FIX A: korelasyon_df NaN → 1.0 fillna (sabit-tahmin algos için)         ║
-║   ✓ FIX B: FAZ 3 top-K kalite filtresi (CV<0.30 trial'lar elensin)          ║
-║   ✓ FIX C: TRIAL_RENAME yukarı taşındı, FAZ 2 inline duplikasyon temizlendi  ║
-║   ✓ İYİ:  "FİNAL 3 ALGORİTMA" gerçek sayıyı gösteriyor                       ║
+║  ─── ÇALIŞMA MODLARI (Kullanıcı Seçer) ───                                  ║
+║   FAST    → Trial ×0.5, Fold ×0.5   (~10-15 dk, test/geliştirme)            ║
+║   DEFAULT → Trial ×1.0, Fold ×1.0   (~25-40 dk, dengeli)                    ║
+║   ULTRA   → Trial ×1.5, Fold ×1.2   (~50-90 dk, yarışma teslimi)            ║
 ║                                                                              ║
-║  v3.1 → v3.2 DÜZELTMELERİ (ES israfı):                                       ║
-║   ✓ FIX D: FAZ 1 objective — non-boosting algos %10 veri kaybı önlendi      ║
-║   ✓ FIX E: FAZ 3 objective — aynı düzeltme derin tuning için                ║
-║   ✓ FIX F: FAZ 4-B — non-boosting final modeller tam X_train kullanır       ║
-║      Net etki: SVM, LR, MLP, RF, ET, kNN, NB algolarına +22-25 örnek geri    ║
-║      kazandırıldı (388 örnekte fark eden bir kazanım).                       ║
+║  ─── DONANIM TESPİTİ (Otomatik) ───                                         ║
+║   • PARALEL_ISCI çekirdek sayısından otomatik (RAM safety margin)            ║
+║   • Sistem profili kutu olarak gösterilir                                    ║
+║   • GPU tespiti bilgi amaçlı (CUDA hâlâ manuel)                              ║
 ║                                                                              ║
-║  v3.2 → v3.3 EKLEMELER (Jüri etkisi):                                        ║
-║   ✓ FIX G: LabelEncoder sınıf haritalaması açıkça yazdırılıyor,             ║
-║      patojenik class 0'da kalırsa otomatik uyarı                            ║
-║   ✓ EK 1: Bootstrap 95% CI (Test F2, F1, AUC için 2000 iterasyon)           ║
-║      "Test F2 = 0.87 [95% CI: 0.82-0.91]" formatında jüri sunumu            ║
-║   ✓ EK 2: Per-class klinik metrikler (Patojenik recall/precision/F2/F1)     ║
-║      KAÇIRILAN patojenik sayısı (false negative = klinik risk)              ║
-║      Yanlış alarm sayısı (false positive = gereksiz takip)                  ║
+║  ─── PIPELINE MİMARİSİ ───                                                  ║
+║   FAZ 1 : 10 algoritma geniş tarama → istatistiksel eleme                   ║
+║   FAZ 2 : Korelasyon + greedy çeşitlilik seçimi → 3 paradigma               ║
+║   FAZ 3 : Seçilen 3 algoritma için derin Optuna tuning                      ║
+║   FAZ 4 : Top-5×3 = 15 üye ensemble + isotonic kalibrasyon                  ║
+║   FAZ 7.5 : Klinik akıllılık — belirsizlik, disagreement, yanlış tahmin    ║
+║   FAZ 8.5 : Solo vs Ensemble hibrit karşılaştırma (TEKNOFEST İLK)           ║
 ║                                                                              ║
-║  v3.3 → v3.4 DÜZELTMELERİ (Run çıktısı ortaya çıkardı):                     ║
-║   ✓ FIX H: CatBoost duplicate verbose=False kaldırıldı (TypeError önlendi)  ║
-║      + bootstrap_type="Bernoulli" → subsample desteği sağlandı              ║
-║   ✓ FIX I: SimpleImputer non-tree pipeline'lara eklendi                     ║
-║      LR/SVM/kNN/NB/MLP artık NaN içeren veriyle çalışabiliyor               ║
-║   ✓ FIX J: SHAP budama top-K mantığına geçti (yüzdelik karşılaştırma değil) ║
-║      Çok sayıda sıfır SHAP değeri olunca da garanti %20 budama              ║
+║  ─── DESTEKLENEN METRİKLER (TEKNOFEST Şartnamesi) ───                       ║
+║   Zorunlu : F1, MCC, PR-AUC                                                 ║
+║   Klinik  : Binary F2, Patojenik recall/precision, FN/FP analizi            ║
+║   Rigor   : Bootstrap %95 CI (dinamik iter, test boyutuna göre)             ║
 ║                                                                              ║
-║  v3.4 → v3.5 METRİK DÜZELTMESİ (Klinik Uyum):                               ║
-║   ✓ weighted F2/F1 → binary F2/F1 (pos_label=1, sadece patojenik sınıfı)    ║
-║      Klinik amaç (patojenik yakalama) ile metrik birebir uyumlu             ║
-║      Optuna objective, eşik optimizasyonu, test raporlama hepsi binary'de   ║
-║   ✓ FAZ 1 tablosuna F1_ort sütunu eklendi (sadece raporlama amaçlı)         ║
-║      Eleme ve seçim hâlâ F2 ile, F1 jüri kıyaslaması için durur             ║
-║                                                                              ║
-║  v3.5 → v3.6 DÜZELTMELERİ (gerçek-veri run'larından çıkanlar):              ║
-║   ✓ FIX M: Kategorik kolonların NaN'ları "EKSİK" string'i ile dolduruluyor  ║
-║      CatBoost float NaN'ı cat_features'da kabul etmiyor → v3.4'te crash    ║
-║      oluyordu. Bu fix sonrası CatBoost FAZ 1'de en iyi F2=0.9615 verdi.    ║
-║   ✓ FIX N: FAZ 3 trial bütçesi algoritmaya göre dict (1500 sabit yerine)   ║
-║      sklearn algos (RF/ET/LR/SVM/kNN/NB/MLP) GIL + joblib overhead'ten      ║
-║      dolayı CPU %10'a düşüyor, 6 saatlik tahminler veriyor. Algo-bazlı     ║
-║      bütçe → FAZ 3 toplam süre ~18 saat'ten ~4 saat'e indi.                ║
-║                                                                              ║
-║  v2.8'in tüm FIX #1-#20 düzeltmeleri korundu.                                ║
-║  10 algoritma: 3 boosting + 2 bagging + 1 linear + 1 kernel + 1 instance-    ║
-║  based + 1 probabilistic + 1 neural → 7 paradigma kapsanır                   ║
+║  Tarihçe detayları: biosense_gelistirme_tarihce.md                          ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
+
 
 import os, sys, json, time, warnings, gc
 
@@ -170,7 +123,9 @@ warnings.filterwarnings("ignore")
 #  KONTROL PANELİ
 # ══════════════════════════════════════════════════════════════════
 import sys
-# [v4.3] Veri seti adı komut satırından alınır: python script.py kanser / master / cftr / pah
+# [v4.9] Komut satırı: python script.py <veri_seti> <mod>
+#        Örnek: python script.py kanser ultra
+#        Mod opsiyonel — verilmezse soracak veya BIOSENSE_MOD env değişkenine bakar
 DATA_SUFFIX = sys.argv[1].lower() if len(sys.argv) > 1 else "kanser"
 print(f"  >>> Çalıştırılan veri seti: {DATA_SUFFIX.upper()}")
 
@@ -189,14 +144,108 @@ CIKTI_JSON     = f"en_iyi_parametreler_{DATA_SUFFIX}_v4.json"
 CIKTI_FAZ1_CSV = f"faz1_algoritma_kiyaslama_{DATA_SUFFIX}.csv"
 CIKTI_KORELASYON_CSV = f"faz2_korelasyon_matrisi_{DATA_SUFFIX}.csv"
 
-# [v4.3] PARALEL_ISCI dinamik (24-core sabitten kurtulduk)
+# [v4.7] Tam dinamik sistem profilleme — RAM, CPU, GPU, data-size aware
 import multiprocessing
+
+def _hesapla_paralel_isci(cpu_logical, cpu_physical, available_ram_gb, data_suffix):
+    """
+    Optimum PARALEL_ISCI hesabı — her sistemde ideal kullanım.
+
+    Mantık:
+    - CPU sınırı: thread sayısına göre (büyük sistemlerde DB lock dikkat)
+    - RAM sınırı: worker başına tahmini RAM × safety margin (70%)
+    - Veri seti boyutu: MASTER per-worker 2.5GB, KANSER 0.8GB
+
+    Örnekler:
+    - i9-14900K (32T) + 96GB RAM + KANSER: 24 worker (CPU bottleneck)
+    - i9-14900K (32T) + 96GB RAM + MASTER: 26 worker (RAM 70% = 67GB / 2.5 = 26)
+    - Ryzen 9 (24T) + 32GB RAM + MASTER: 8 worker (RAM bottleneck)
+    - i5 (8T) + 16GB + KANSER: 8 worker (CPU bottleneck)
+    """
+    # Worker başı RAM tahmini (veri setine göre)
+    if data_suffix == "master":
+        per_worker_gb = 2.5
+    elif data_suffix in ("cftr", "pah"):
+        per_worker_gb = 1.5
+    else:  # kanser, default
+        per_worker_gb = 0.8
+
+    # RAM tabanlı limit (%70 worker'lara, %30 sistem+cache pay)
+    ram_limit = max(2, int(available_ram_gb * 0.7 / per_worker_gb))
+
+    # CPU tabanlı limit
+    if cpu_logical <= 8:
+        cpu_limit = cpu_logical
+    elif cpu_logical <= 16:
+        cpu_limit = cpu_logical - 2  # 14T, 12T
+    elif cpu_logical <= 24:
+        cpu_limit = 20  # Ultra 9 24T sweet spot
+    elif cpu_logical <= 32:
+        cpu_limit = 24  # i9-14900K 32T (E-core'lar yavaş)
+    elif cpu_logical <= 48:
+        cpu_limit = 28  # Threadripper sınıfı
+    else:
+        cpu_limit = 32  # Üzeri DB kilit contention sorunu
+
+    return min(cpu_limit, ram_limit), per_worker_gb, ram_limit, cpu_limit
+
 try:
-    PARALEL_ISCI = min(multiprocessing.cpu_count(), 24)
-    print(f"  >>> Tespit edilen logical core: {multiprocessing.cpu_count()}, "
-          f"PARALEL_ISCI: {PARALEL_ISCI}")
-except Exception:
+    _cpu_count_logical = multiprocessing.cpu_count()
+
+    # psutil ile detaylı tespit
+    try:
+        import psutil
+        _cpu_count_physical = psutil.cpu_count(logical=False) or (_cpu_count_logical // 2)
+        _vm = psutil.virtual_memory()
+        _total_ram_gb     = _vm.total / (1024**3)
+        _available_ram_gb = _vm.available / (1024**3)
+        _ram_kullanim_pct = _vm.percent
+        PSUTIL_OK = True
+    except ImportError:
+        _cpu_count_physical = max(_cpu_count_logical // 2, 1)
+        _total_ram_gb       = 16
+        _available_ram_gb   = 12
+        _ram_kullanim_pct   = 25
+        PSUTIL_OK = False
+
+    # Akıllı hesaplama
+    PARALEL_ISCI, _per_worker_gb, _ram_limit, _cpu_limit = _hesapla_paralel_isci(
+        _cpu_count_logical, _cpu_count_physical, _available_ram_gb, DATA_SUFFIX
+    )
+
+    print(f"\n  ┌── SİSTEM PROFİLİ ─────────────────────────────────────────┐")
+    print(f"  │  CPU       : {_cpu_count_logical} logical / {_cpu_count_physical} physical core")
+    print(f"  │  RAM       : {_total_ram_gb:.1f}GB toplam, "
+          f"{_available_ram_gb:.1f}GB kullanılabilir ({_ram_kullanim_pct:.0f}% dolu)")
+    print(f"  │  Veri seti : {DATA_SUFFIX.upper()} → per-worker ~{_per_worker_gb}GB tahmini")
+    print(f"  │  CPU limit : {_cpu_limit} worker  |  RAM limit: {_ram_limit} worker")
+    print(f"  │  → PARALEL_ISCI: {PARALEL_ISCI}  ({_cpu_limit if PARALEL_ISCI == _cpu_limit else _ram_limit}-bound)")
+    if not PSUTIL_OK:
+        print(f"  │  [UYARI] psutil yok → varsayılan RAM tahmini kullanıldı")
+        print(f"  │           Daha doğru tespit için: pip install psutil")
+    print(f"  └────────────────────────────────────────────────────────────┘")
+except Exception as e:
     PARALEL_ISCI = 8
+    print(f"  [UYARI] Sistem tespiti başarısız, varsayılan PARALEL_ISCI=8: {e}")
+
+# [v4.7] GPU tespiti — XGBoost/LightGBM için
+GPU_VAR = False
+GPU_BILGI = "yok"
+try:
+    import subprocess
+    _gpu_check = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total",
+                                   "--format=csv,noheader"],
+                                  capture_output=True, text=True, timeout=5)
+    if _gpu_check.returncode == 0 and _gpu_check.stdout.strip():
+        GPU_VAR = True
+        GPU_BILGI = _gpu_check.stdout.strip().split("\n")[0]
+        print(f"  GPU       : {GPU_BILGI}")
+        if DATA_SUFFIX == "master":
+            print(f"              → MASTER için 'device=cuda' önerilir (3-5x hızlanma)")
+    else:
+        print(f"  GPU       : Yok / nvidia-smi erişilemez (CPU modu)")
+except Exception:
+    print(f"  GPU       : Tespit edilemedi (CPU modu)")
 
 # [FIX O] Algoritmaya göre paralellik stratejisi (CPU %10 problemini çözer)
 # Sorun: 24 dış worker × 24 iç thread = 576 thread → GIL bottleneck + DB lock
@@ -216,10 +265,10 @@ def algo_paralelizm(algo):
     return (PARALEL_ISCI, 1)        # Dış paralel, iç tek thread
 
 # ── FAZ 1: Geniş tarama ───────────────────────────────────────────
+# [v4.9] BU PARAMETRELER DİNAMİK — kullanıcı modu + sistem otomatik birleştirilir
 FAZ1_FOLDS     = 5
-FAZ1_TEKRAR    = 20         # 5×20 = 100 fold (kararlılık için)
-# Algoritma başına Optuna trial sayısı (karmaşıklığa göre değişiyor)
-FAZ1_TRIAL_PER_ALGO = {
+FAZ1_TEKRAR    = 20
+FAZ1_TRIAL_PER_ALGO_BASE = {
     "xgboost":       80,
     "lightgbm":      80,
     "catboost":      60,
@@ -228,49 +277,130 @@ FAZ1_TRIAL_PER_ALGO = {
     "logistic":      40,
     "svm_rbf":       60,
     "knn":           20,
-    "naive_bayes":    5,    # çok az hiperparametre
+    "naive_bayes":    5,
     "mlp":           80,
 }
 FAZ1_DB_PREFIX = f"sqlite:///biosense_faz1_v4_{DATA_SUFFIX}"
 
-# FAZ 1 eleme kriterleri (3'ü AYNI ANDA sağlanırsa elenir)
-FAZ1_F2_ORT_ESIK    = 0.70   # F2 ortalama bu altındaysa
-FAZ1_F2_LCB_ESIK    = 0.65   # (F2_ort - 0.5×std) bu altındaysa
-FAZ1_TTEST_P_ESIK   = 0.05   # ve top'a göre t-test p<0.05 ise
+FAZ1_F2_ORT_ESIK    = 0.70
+FAZ1_F2_LCB_ESIK    = 0.65
+FAZ1_TTEST_P_ESIK   = 0.05
 
 # ── FAZ 2: Çeşitlilik Seçimi ──────────────────────────────────────
 FAZ2_FOLDS_OOF     = 5
 FAZ2_TEKRAR_OOF    = 10
-FAZ2_SECILEN_SAYI  = 3       # final ensemble paradigma sayısı
+FAZ2_SECILEN_SAYI  = 3
 FAZ2_OOF_ES_SPLIT  = 0.12
 
 # ── FAZ 3: Derin Tuning ───────────────────────────────────────────
-# [FIX N] Algoritma bazlı trial bütçesi. Önceki tek-sayı yaklaşımı
-# (1500 her algoritma için) sklearn-tabanlı algos için verimsizdi:
-# - XGB/LGB/CB: C++ tabanlı, paralelizm verimli → 1000-1500 trial mantıklı
-# - sklearn (RF, ET, LR, SVM, kNN, NB, MLP): Python GIL + joblib spawn
-#   overhead → CPU %10'a düşüyor. 500 trial sklearn için zaten doyurur,
-#   hyperparameter yüzeyleri daha düz.
-# Net etki: FAZ 3 toplam süresi ~18 saat → ~4 saat.
-FAZ3_TRIAL_PER_ALGO = {
-    # C++ tabanlı boosting — paralelizm verimli
+FAZ3_TRIAL_PER_ALGO_BASE = {
     "xgboost":       1500,
     "lightgbm":      1500,
     "catboost":      1000,
-    # sklearn tree — paralelizm verimsiz, az trial yeterli
     "random_forest":  500,
     "extra_trees":    500,
-    # sklearn non-tree
     "logistic":       600,
-    "svm_rbf":        400,   # probability=True yavaş
-    "knn":            200,   # 3 hyperparam, hızla doyurur
-    "naive_bayes":    100,   # 1 hyperparam
+    "svm_rbf":        400,
+    "knn":            200,
+    "naive_bayes":    100,
     "mlp":            800,
 }
 FAZ3_FOLDS          = 5
-FAZ3_TEKRAR         = 10     # 50 fold
+FAZ3_TEKRAR         = 10
 FAZ3_DB_PREFIX      = f"sqlite:///biosense_faz3_v4_{DATA_SUFFIX}"
-FAZ3_TOP_K          = 5      # her algo'dan ensemble'a ekle
+FAZ3_TOP_K          = 5
+
+# [v4.9] ─── KULLANICI MOD SEÇİMİ ───
+# Kullanıcı kalite/hız tercihini seçer, geri kalanı otomatik.
+# PARALEL_ISCI hâlâ sistemden çekilir (CPU+RAM dinamik).
+
+def _mod_sec():
+    """
+    Kullanıcıdan FAST / DEFAULT / ULTRA mod seçimini al.
+    - Komut satırı argümanı: python script.py kanser fast
+    - Environment variable: set BIOSENSE_MOD=ultra
+    - İnteraktif: kullanıcıya sor
+    """
+    # 1. Komut satırından mod argümanı (3. argüman)
+    if len(sys.argv) > 2:
+        mod_arg = sys.argv[2].lower()
+        if mod_arg in ("fast", "default", "ultra"):
+            return mod_arg
+
+    # 2. Environment variable
+    env_mod = os.environ.get("BIOSENSE_MOD", "").lower()
+    if env_mod in ("fast", "default", "ultra"):
+        print(f"  [v4.9] BIOSENSE_MOD env değişkeni bulundu: {env_mod.upper()}")
+        return env_mod
+
+    # 3. İnteraktif soru
+    print(f"\n  ┌── ÇALIŞMA MODU SEÇİMİ ────────────────────────────────────┐")
+    print(f"  │                                                            │")
+    print(f"  │  [1] FAST     → Hızlı (test/geliştirme için, ~10-15 dk)    │")
+    print(f"  │                  Trial %50, fold %50, sonuç ±%5            │")
+    print(f"  │                                                            │")
+    print(f"  │  [2] DEFAULT  → Standart kalite (önerilen, ~25-40 dk)      │")
+    print(f"  │                  Trial %100, fold %100, dengeli            │")
+    print(f"  │                                                            │")
+    print(f"  │  [3] ULTRA    → Maksimum kalite (yarışma teslimi, ~50-90)  │")
+    print(f"  │                  Trial %150, fold %120, +10% iter          │")
+    print(f"  │                                                            │")
+    print(f"  └────────────────────────────────────────────────────────────┘")
+
+    try:
+        secim = input("  Seçim [1/2/3] veya isim [fast/default/ultra] (default=2): ").strip().lower()
+        if secim in ("1", "fast", "f"): return "fast"
+        if secim in ("3", "ultra", "u"): return "ultra"
+        if secim in ("2", "default", "d", ""): return "default"
+        print(f"  [UYARI] Geçersiz seçim '{secim}', DEFAULT moda geçiliyor.")
+        return "default"
+    except (EOFError, KeyboardInterrupt):
+        # Non-interactive ortamda (örn. nohup, &)
+        print(f"  [BİLGİ] İnteraktif input alınamadı, DEFAULT mod kullanılıyor.")
+        return "default"
+
+CALISMA_MODU = _mod_sec()
+
+# Mod çarpanları
+_MOD_CARPANI = {
+    "fast":    {"trial": 0.5,  "fold": 0.5,  "iter": 0.7,
+                "label": "FAST", "renk": "🟢"},
+    "default": {"trial": 1.0,  "fold": 1.0,  "iter": 1.0,
+                "label": "DEFAULT", "renk": "🟡"},
+    "ultra":   {"trial": 1.5,  "fold": 1.2,  "iter": 1.1,
+                "label": "ULTRA", "renk": "🔴"},
+}
+
+_c = _MOD_CARPANI[CALISMA_MODU]
+
+# Pipeline parametrelerini moda göre ölçekle
+def _olcekle(d, multiplier, min_val=5):
+    return {k: max(min_val, int(v * multiplier)) for k, v in d.items()}
+
+FAZ1_TRIAL_PER_ALGO = _olcekle(FAZ1_TRIAL_PER_ALGO_BASE, _c["trial"], min_val=5)
+FAZ3_TRIAL_PER_ALGO = _olcekle(FAZ3_TRIAL_PER_ALGO_BASE, _c["trial"], min_val=50)
+FAZ1_TEKRAR = max(5, int(FAZ1_TEKRAR * _c["fold"]))
+FAZ3_TEKRAR = max(3, int(FAZ3_TEKRAR * _c["fold"]))
+FAZ2_TEKRAR_OOF = max(3, int(FAZ2_TEKRAR_OOF * _c["fold"]))
+
+# Tahmini süre (KANSER referansı: DEFAULT modda ~25 dk)
+_sure_carpanlari = {"fast": 0.5, "default": 1.0, "ultra": 1.8}
+_tahmini_sure_dk = int(25 * _sure_carpanlari[CALISMA_MODU])
+
+print(f"\n  ┌── ÇALIŞMA MODU AKTIF ─────────────────────────────────────┐")
+print(f"  │  Mod              : {_c['label']:<14} {_c['renk']:>2}                    │")
+print(f"  │  Trial çarpanı    : ×{_c['trial']}  → FAZ1: {sum(FAZ1_TRIAL_PER_ALGO.values())} trial, "
+      f"FAZ3: {sum(FAZ3_TRIAL_PER_ALGO.values())} trial")
+print(f"  │  Fold çarpanı     : ×{_c['fold']}  → FAZ1: {FAZ1_FOLDS*FAZ1_TEKRAR} fold, "
+      f"FAZ3: {FAZ3_FOLDS*FAZ3_TEKRAR} fold")
+print(f"  │  Iter çarpanı     : ×{_c['iter']}  (model n_estimators)")
+print(f"  │  Tahmini süre     : ~{_tahmini_sure_dk} dakika (DB cache'li run)")
+print(f"  │  PARALEL_ISCI     : {PARALEL_ISCI} (sistemden otomatik)")
+if CALISMA_MODU == "fast":
+    print(f"  │  ⚠ Sonuçlar ~5-10% daha düşük doğrulukta olabilir         │")
+elif CALISMA_MODU == "ultra":
+    print(f"  │  ✓ Maksimum kararlılık — yarışma teslimi için ideal       │")
+print(f"  └────────────────────────────────────────────────────────────┘\n")
 
 # ── FAZ 4: Ensemble + Test ────────────────────────────────────────
 OOF_FOLDS      = 5
@@ -331,7 +461,7 @@ PREPROCESSING_GEREK = {
 }
 
 print("=" * 72)
-print("  BioSense AI v4.3 — ÇOKLU VERİ SETİ + Cache + Dinamik Bootstrap")
+print("  BioSense AI v5.1 — Jüri Etkisi 4 Yeni Görsel + Kullanıcı Modu + Otomatik Donanım")
 print(f"  Toplam algoritma havuzu: {len(TUM_ALGORITMALAR)}")
 print(f"  FAZ 1: {sum(FAZ1_TRIAL_PER_ALGO.get(a, 30) for a in TUM_ALGORITMALAR)} "
       f"trial × {FAZ1_FOLDS*FAZ1_TEKRAR} fold")
@@ -385,8 +515,12 @@ for col in X.columns:
         X[col] = X[col].fillna("EKSİK").astype(str).astype("category")
         KAT_KOLONLAR.append(col)
 
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=TEST_ORANI, random_state=RASTGELE_TOHUM, stratify=y
+# [v4.5] Variant_ID'leri de split et — yanlış tahmin tablosu için
+_variant_ids_all = df["Variant_ID"].values if "Variant_ID" in df.columns else \
+                   np.array([f"VAR_{i}" for i in range(len(df))])
+X_train, X_test, y_train, y_test, variant_ids_train, variant_ids_test = train_test_split(
+    X, y, _variant_ids_all,
+    test_size=TEST_ORANI, random_state=RASTGELE_TOHUM, stratify=y
 )
 y_train = np.array(y_train)
 y_test  = np.array(y_test)
@@ -739,6 +873,311 @@ def shap_bar_grafigi(top_features, top_values,
     yol = os.path.join(GRAFIK_KLASOR, dosya_adi)
     plt.savefig(yol, dpi=150, bbox_inches="tight")
     plt.close()
+
+# ══════════════════════════════════════════════════════════════════
+# [v5.1] JÜRİ ETKİSİ İÇİN 4 YENİ GÖRSEL FONKSİYONU
+# ══════════════════════════════════════════════════════════════════
+
+def trial_convergence_grafigi(study, algo_adi,
+                               dosya_adi_format="trial_convergence_{algo}.png"):
+    """
+    [v5.1] Optuna study trial.value progression eğrisi.
+    Jüri için: 'sistematik hiperparametre araması' kanıtı.
+
+    İki çizgi:
+    - Gri (alpha): her trial'ın F2 skoru (gürültülü)
+    - Kırmızı: kümülatif en iyi (best so far)
+    """
+    if not MATPLOTLIB_OK:
+        return
+    try:
+        trials = [t for t in study.trials if t.value is not None]
+        if len(trials) < 5:
+            return  # çok az trial, anlamlı grafik olmaz
+        values = [t.value for t in trials]
+        best_so_far = np.maximum.accumulate(values)
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(range(1, len(values)+1), values,
+                 alpha=0.4, color="gray", lw=0.8,
+                 marker="o", markersize=3, label="Her trial")
+        ax.plot(range(1, len(best_so_far)+1), best_so_far,
+                 color="#d62728", lw=2.5, label="En iyi (kümülatif)")
+
+        ax.set_xlabel("Trial #", fontsize=11, fontweight="bold")
+        ax.set_ylabel("CV F2 Skoru", fontsize=11, fontweight="bold")
+        ax.set_title(f"Optuna Convergence: {algo_adi.upper()}\n"
+                      f"Sistematik Hiperparametre Araması (TPE Multivariate)",
+                      fontsize=12, fontweight="bold")
+        ax.legend(loc="lower right", fontsize=10)
+        ax.grid(linestyle="--", alpha=0.6)
+
+        # En iyi trial işaretle
+        best_idx = int(np.argmax(values))
+        best_val = values[best_idx]
+        ax.annotate(f"En iyi: trial #{best_idx+1}\nF2={best_val:.4f}",
+                     xy=(best_idx+1, best_val),
+                     xytext=(best_idx+1 + len(values)*0.15, best_val - 0.02),
+                     fontsize=10, fontweight="bold",
+                     arrowprops=dict(arrowstyle="->", color="#d62728"),
+                     bbox=dict(boxstyle="round,pad=0.3", fc="lightyellow", ec="gray"))
+
+        plt.tight_layout()
+        yol = os.path.join(GRAFIK_KLASOR, dosya_adi_format.format(algo=algo_adi))
+        plt.savefig(yol, dpi=150, bbox_inches="tight")
+        plt.close()
+        return yol
+    except Exception as e:
+        print(f"    [UYARI] Trial convergence grafiği başarısız ({algo_adi}): {e}")
+        return None
+
+
+def pipeline_funnel_diyagrami(istatistikler,
+                                dosya_adi="pipeline_funnel.png"):
+    """
+    [v5.1] 4-faz pipeline akış diyagramı.
+    Jüri için: 'sistematik hiyerarşik mimari' görseli (Word SmartArt yerine).
+
+    istatistikler: {
+        "n_train": 310, "n_test": 78,
+        "n_ozellik_baslangic": 282, "n_ozellik_son": 225,
+        "faz1_algos": 10, "faz1_kalan": 9, "faz1_total_trial": 525,
+        "faz2_secilen": 3, "secilen_algos": ["extra_trees", "knn", "logistic"],
+        "faz3_total_trial": 7100,
+        "ensemble_uye_sayisi": 15,
+    }
+    """
+    if not MATPLOTLIB_OK:
+        return
+
+    fig, ax = plt.subplots(figsize=(13, 9))
+    ax.set_xlim(0, 10); ax.set_ylim(0, 12)
+    ax.axis("off")
+
+    # Renk paleti (gradient mavi)
+    renkler = ["#2E86AB", "#5DADE2", "#85C1E2", "#AED6F1", "#D6EAF8"]
+
+    fazlar = [
+        {
+            "label": "VERİ HAZIRLIĞI",
+            "alt":   f"{istatistikler['n_train']} train + {istatistikler['n_test']} test\n"
+                     f"{istatistikler['n_ozellik_baslangic']} → {istatistikler['n_ozellik_son']} özellik (SHAP)",
+            "y_top": 11.5, "y_bot": 10.0, "wt": 9, "wb": 8.5
+        },
+        {
+            "label": "FAZ 1: GENİŞ TARAMA",
+            "alt":   f"{istatistikler['faz1_algos']} algoritma × "
+                     f"{istatistikler['faz1_total_trial']} trial\n"
+                     f"İstatistiksel eleme (F2+LCB+p-value)\n"
+                     f"Hayatta kalan: {istatistikler['faz1_kalan']} algoritma",
+            "y_top": 9.7, "y_bot": 7.7, "wt": 8.5, "wb": 7.5
+        },
+        {
+            "label": "FAZ 2: ÇEŞİTLİLİK SEÇİMİ",
+            "alt":   f"Korelasyon matrisi + Greedy seçim\n"
+                     f"Final: {istatistikler['faz2_secilen']} paradigma\n"
+                     f"{', '.join(istatistikler['secilen_algos'])}",
+            "y_top": 7.4, "y_bot": 5.4, "wt": 7.5, "wb": 6.0
+        },
+        {
+            "label": "FAZ 3: DERİN TUNING",
+            "alt":   f"3 algoritma × derin Optuna\n"
+                     f"Toplam: {istatistikler['faz3_total_trial']} trial\n"
+                     f"TPE Multivariate, 50 fold CV",
+            "y_top": 5.1, "y_bot": 3.1, "wt": 6.0, "wb": 4.5
+        },
+        {
+            "label": "FAZ 4: ENSEMBLE + KALİBRASYON",
+            "alt":   f"{istatistikler['ensemble_uye_sayisi']} üyeli ensemble\n"
+                     f"Isotonic Regression kalibrasyonu\n"
+                     f"Bootstrap %95 CI ile test",
+            "y_top": 2.8, "y_bot": 0.8, "wt": 4.5, "wb": 3.0
+        },
+    ]
+
+    for i, f in enumerate(fazlar):
+        renk = renkler[i]
+        # Trapez şekli
+        x_center = 5
+        wt, wb = f["wt"], f["wb"]
+        verts = [
+            (x_center - wt/2, f["y_top"]),
+            (x_center + wt/2, f["y_top"]),
+            (x_center + wb/2, f["y_bot"]),
+            (x_center - wb/2, f["y_bot"]),
+        ]
+        from matplotlib.patches import Polygon
+        poly = Polygon(verts, closed=True, facecolor=renk,
+                        edgecolor="black", linewidth=1.5, alpha=0.85)
+        ax.add_patch(poly)
+
+        # Üst label
+        y_label = (f["y_top"] + f["y_bot"]) / 2 + 0.4
+        ax.text(x_center, y_label, f["label"],
+                 ha="center", va="center", fontsize=13, fontweight="bold",
+                 color="white" if i < 3 else "black")
+        # Alt detay
+        y_alt = (f["y_top"] + f["y_bot"]) / 2 - 0.3
+        ax.text(x_center, y_alt, f["alt"],
+                 ha="center", va="center", fontsize=9.5,
+                 color="white" if i < 3 else "black")
+
+        # Aşağı yönlü ok (son hariç)
+        if i < len(fazlar) - 1:
+            y_ok = f["y_bot"] - 0.1
+            ax.annotate("", xy=(x_center, y_ok - 0.15),
+                         xytext=(x_center, y_ok + 0.1),
+                         arrowprops=dict(arrowstyle="->",
+                                          color="black", lw=2))
+
+    ax.set_title("BioSense AI — 4 Faz Hiyerarşik Pipeline Mimarisi\n"
+                  "Sistematik Eleme + Çeşitlilik + Derinlik + Robustluk",
+                  fontsize=15, fontweight="bold", pad=20)
+    plt.tight_layout()
+    yol = os.path.join(GRAFIK_KLASOR, dosya_adi)
+    plt.savefig(yol, dpi=150, bbox_inches="tight")
+    plt.close()
+    return yol
+
+
+def feature_group_analizi(all_cols, mean_abs_shap,
+                            dosya_adi="feature_grup_analizi.png"):
+    """
+    [v5.1] Özellik prefix gruplarına göre SHAP toplam katkı analizi.
+    Jüri için: 'özellik grubu bazlı karar dağılımı' görseli.
+
+    Prefix tespit kuralı: ilk underscore'a kadar (EK_, AL_, AA_, CAT_)
+    """
+    if not MATPLOTLIB_OK:
+        return None
+
+    from collections import defaultdict
+    grup_shap   = defaultdict(float)
+    grup_sayisi = defaultdict(int)
+
+    for col, sv in zip(all_cols, mean_abs_shap):
+        col_str = str(col)
+        if "_" in col_str:
+            prefix = col_str.split("_")[0] + "_*"
+        else:
+            prefix = "DIĞER"
+        grup_shap[prefix] += float(sv)
+        grup_sayisi[prefix] += 1
+
+    # Sıralı liste
+    sirali = sorted(grup_shap.items(), key=lambda x: x[1], reverse=True)
+    gruplar = [g[0] for g in sirali]
+    katkilar = [g[1] for g in sirali]
+    sayilar  = [grup_sayisi[g] for g in gruplar]
+    toplam = sum(katkilar)
+    yuzdeler = [k / toplam * 100 for k in katkilar]
+
+    # İki panel: pasta + bar
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 7))
+
+    # Sol: Pasta grafiği
+    renkler = plt.cm.Set2(np.linspace(0, 1, len(gruplar)))
+    labels_pasta = [f"{g}\n({s} özellik)" for g, s in zip(gruplar, sayilar)]
+    wedges, _, autotexts = ax1.pie(katkilar, labels=labels_pasta,
+                                      autopct="%1.1f%%",
+                                      colors=renkler, startangle=90,
+                                      textprops={"fontsize": 10})
+    for at in autotexts:
+        at.set_fontweight("bold")
+        at.set_color("white")
+    ax1.set_title("Özellik Grubu Bazlı SHAP Katkısı\n(Karar oluşum payları)",
+                   fontsize=12, fontweight="bold")
+
+    # Sağ: Bar grafiği (ortalama SHAP per grup)
+    ort_shaps = [katkilar[i]/sayilar[i] for i in range(len(gruplar))]
+    bars = ax2.barh(range(len(gruplar)), ort_shaps,
+                      color=renkler, edgecolor="black")
+    ax2.set_yticks(range(len(gruplar)))
+    ax2.set_yticklabels(gruplar)
+    ax2.invert_yaxis()
+    ax2.set_xlabel("Ortalama |SHAP| per özellik", fontsize=11, fontweight="bold")
+    ax2.set_title("Grup-içi Ortalama Önem\n(grup başı yoğunluk)",
+                   fontsize=12, fontweight="bold")
+    ax2.grid(axis="x", linestyle="--", alpha=0.6)
+    for i, (b, v) in enumerate(zip(bars, ort_shaps)):
+        ax2.text(v + max(ort_shaps)*0.01, i, f"{v:.4f}",
+                  va="center", fontsize=9)
+
+    plt.suptitle("Feature Group Analysis — Özellik Prefix Bazlı Önem Dağılımı",
+                  fontsize=13, fontweight="bold", y=1.02)
+    plt.tight_layout()
+    yol = os.path.join(GRAFIK_KLASOR, dosya_adi)
+    plt.savefig(yol, dpi=150, bbox_inches="tight")
+    plt.close()
+
+    return {
+        "gruplar":  gruplar,
+        "katkilar": [round(k, 5) for k in katkilar],
+        "yuzdeler": [round(y, 2) for y in yuzdeler],
+        "sayilar":  sayilar,
+    }
+
+
+def ensemble_shap_hesapla(final_modeller_tree, X_train, X_test_sample,
+                            dosya_adi="ensemble_shap.png"):
+    """
+    [v5.1] Final ensemble'ın SHAP analizi.
+    Sadece tree-based modeller için TreeExplainer (kNN/Logistic atlanır).
+    Ensemble'ın gerçek karar mantığını gösterir (referans XGBoost değil).
+    """
+    if not MATPLOTLIB_OK or not final_modeller_tree:
+        return None
+    try:
+        tum_shaps = []
+        for m in final_modeller_tree:
+            try:
+                explainer = shap.TreeExplainer(m)
+                sv = explainer.shap_values(X_test_sample)
+                if isinstance(sv, list):
+                    sv = sv[1]
+                elif hasattr(sv, "ndim") and sv.ndim == 3:
+                    sv = sv[:, :, 1]
+                tum_shaps.append(np.abs(sv).mean(axis=0))
+            except Exception:
+                continue
+
+        if not tum_shaps:
+            return None
+        ortalama_shap = np.mean(tum_shaps, axis=0)
+        ozellikler    = list(X_test_sample.columns)
+
+        # Top 15
+        top15_idx = np.argsort(ortalama_shap)[::-1][:15]
+        top15_feat = [ozellikler[i] for i in top15_idx]
+        top15_vals = [float(ortalama_shap[i]) for i in top15_idx]
+
+        # Görsel
+        fig, ax = plt.subplots(figsize=(10, 7))
+        ax.barh(range(len(top15_feat)), top15_vals,
+                 color="#2ca02c", edgecolor="black")
+        ax.set_yticks(range(len(top15_feat)))
+        ax.set_yticklabels(top15_feat)
+        ax.invert_yaxis()
+        ax.set_xlabel("Ortalama |SHAP| (Ensemble Tree Üyeleri)",
+                       fontsize=11, fontweight="bold")
+        ax.set_title(f"Final Ensemble SHAP — Top 15 Özellik\n"
+                       f"({len(tum_shaps)} tree üyesinin ortalaması)\n"
+                       f"Gerçek karar mantığı, referans modelin değil",
+                       fontsize=12, fontweight="bold")
+        ax.grid(axis="x", linestyle="--", alpha=0.6)
+        for i, v in enumerate(top15_vals):
+            ax.text(v + max(top15_vals)*0.01, i, f"{v:.4f}",
+                     va="center", fontsize=9)
+        plt.tight_layout()
+        yol = os.path.join(GRAFIK_KLASOR, dosya_adi)
+        plt.savefig(yol, dpi=150, bbox_inches="tight")
+        plt.close()
+
+        return {"top15_features": top15_feat, "top15_values": top15_vals}
+    except Exception as e:
+        print(f"  [UYARI] Ensemble SHAP başarısız: {e}")
+        return None
+
 
 def karar_esigi_tablosu(y_true, y_proba, esikler=None):
     """
@@ -1283,44 +1722,72 @@ def trial_to_model_params(algo, trial_params, n_jobs_override=None):
 #  2. SHAP ÖZELLİK BUDAMA (v2.8 FIX #2 + #13 + #18)
 # ══════════════════════════════════════════════════════════════════
 print(f"\n[2/9] SHAP özellik budama (alt %{SHAP_PERCENTILE} atılıyor)...")
+SHAP_CACHE_PATH = f"shap_cache_{DATA_SUFFIX}.npz"
 if SHAP_OK and SHAP_PERCENTILE > 0:
+    # [v4.5] SHAP cache — eğer önceki run'da hesaplandıysa yükle, ~2 dk tasarruf
+    shap_cache_yuklendi = False
+    if os.path.exists(SHAP_CACHE_PATH):
+        try:
+            _cached = np.load(SHAP_CACHE_PATH, allow_pickle=True)
+            _cached_cols = _cached["all_cols"].tolist()
+            # Cache validation: özellik isimleri eşleşmeli
+            if _cached_cols == list(X_train.columns):
+                mean_abs_shap = _cached["mean_abs_shap"]
+                onem_sirasi   = _cached["onem_sirasi"]
+                all_cols      = _cached_cols
+                print(f"  [v4.5] SHAP cache yüklendi: {SHAP_CACHE_PATH}")
+                shap_cache_yuklendi = True
+            else:
+                print(f"  [v4.5] SHAP cache özellik uyumsuzluğu, yeniden hesaplanacak.")
+        except Exception as e:
+            print(f"  [v4.5] SHAP cache yükleme hatası: {e}, yeniden hesaplanacak.")
+
     try:
-        SHAP_XGB_PARAMS = {
-            "enable_categorical": True, "tree_method": "hist", "device": "cpu",
-            "verbosity": 0, "n_jobs": -1, "random_state": RASTGELE_TOHUM,
-            "n_estimators": 200, "max_depth": 6,
-            "learning_rate": 0.05, "subsample": 0.8, "scale_pos_weight": SPW,
-        }
-        print("  SHAP referans modeli (XGBoost) eğitiliyor...")
-        shap_model = xgb.XGBClassifier(**SHAP_XGB_PARAMS)
-        shap_model.fit(X_train, y_train)
+        if not shap_cache_yuklendi:
+            SHAP_XGB_PARAMS = {
+                "enable_categorical": True, "tree_method": "hist", "device": "cpu",
+                "verbosity": 0, "n_jobs": -1, "random_state": RASTGELE_TOHUM,
+                "n_estimators": 200, "max_depth": 6,
+                "learning_rate": 0.05, "subsample": 0.8, "scale_pos_weight": SPW,
+            }
+            print("  SHAP referans modeli (XGBoost) eğitiliyor...")
+            shap_model = xgb.XGBClassifier(**SHAP_XGB_PARAMS)
+            shap_model.fit(X_train, y_train)
 
-        explainer   = shap.TreeExplainer(shap_model)
-        shap_values = explainer.shap_values(X_train)
-        # v2.8 FIX #13: yeni SHAP API 3D array
-        if isinstance(shap_values, list):
-            shap_values = shap_values[1]
-        elif hasattr(shap_values, "ndim") and shap_values.ndim == 3:
-            shap_values = shap_values[:, :, 1]
+            explainer   = shap.TreeExplainer(shap_model)
+            shap_values = explainer.shap_values(X_train)
+            if isinstance(shap_values, list):
+                shap_values = shap_values[1]
+            elif hasattr(shap_values, "ndim") and shap_values.ndim == 3:
+                shap_values = shap_values[:, :, 1]
 
-        all_cols      = list(X_train.columns)
-        mean_abs_shap = np.abs(shap_values).mean(axis=0)
+            all_cols      = list(X_train.columns)
+            mean_abs_shap = np.abs(shap_values).mean(axis=0)
+            onem_sirasi   = np.argsort(mean_abs_shap)[::-1]
+
+            # Cache'e kaydet (sonraki run'lar için)
+            try:
+                np.savez(SHAP_CACHE_PATH,
+                          mean_abs_shap=mean_abs_shap,
+                          onem_sirasi=onem_sirasi,
+                          all_cols=np.array(all_cols, dtype=object))
+                print(f"  [v4.5] SHAP cache kaydedildi: {SHAP_CACHE_PATH}")
+            except Exception as e:
+                print(f"  [v4.5] Cache kaydedilemedi: {e}")
+            del shap_values, shap_model, explainer
+            gc.collect()
 
         print("\n  Top 10 SHAP Özelliği:")
-        onem_sirasi = np.argsort(mean_abs_shap)[::-1]
-        shap_max = max(float(mean_abs_shap.max()), 1e-9)   # FIX #18
+        shap_max = max(float(mean_abs_shap.max()), 1e-9)
         for rk in onem_sirasi[:10]:
             bar = "█" * int(mean_abs_shap[rk] / shap_max * 35)
             print(f"    {all_cols[rk]:<30} {bar}  {mean_abs_shap[rk]:.5f}")
 
-        # [FIX J] Yüzdelik temelli ">=" karşılaştırması: çok sayıda özellik
-        # aynı SHAP değerine sahipse (örn. çoğu 0.0) yüzdelik 0.0'a düşer ve
-        # tüm özellikler tutulur. Top-K ile garanti %20 budama.
         n_kalan = max(1, int(len(mean_abs_shap) * (1 - SHAP_PERCENTILE / 100)))
         top_idx = np.argsort(mean_abs_shap)[::-1][:n_kalan]
         kalan_mask = np.zeros(len(mean_abs_shap), dtype=bool)
         kalan_mask[top_idx] = True
-        shap_esik  = float(mean_abs_shap[top_idx[-1]])  # gerçek alt eşik
+        shap_esik  = float(mean_abs_shap[top_idx[-1]])
         kalan_cols = [c for c, keep in zip(all_cols, kalan_mask) if keep]
         budanan_cnt = len(all_cols) - len(kalan_cols)
 
@@ -1331,14 +1798,27 @@ if SHAP_OK and SHAP_PERCENTILE > 0:
 
         print(f"\n  {len(kalan_cols)} özellik kaldı ({budanan_cnt} budandı)")
 
-        # v4.1: SHAP top 15 özellik grafiği (rapor için açıklanabilirlik)
+        # v4.1: SHAP top 15 özellik grafiği
         top15_idx = onem_sirasi[:15]
         top15_features = [all_cols[i] for i in top15_idx]
         top15_values   = [float(mean_abs_shap[i]) for i in top15_idx]
         shap_bar_grafigi(top15_features, top15_values)
-        print(f"  → grafikler/shap_top_ozellikler.png kaydedildi.")
-        del shap_values, shap_model, explainer
-        gc.collect()
+        print(f"  → {GRAFIK_KLASOR}/shap_top_ozellikler.png kaydedildi.")
+
+        # [v5.1] Feature group analizi (prefix-bazlı SHAP toplaması)
+        try:
+            grup_analiz = feature_group_analizi(all_cols, mean_abs_shap)
+            if grup_analiz:
+                print(f"\n  Özellik Grubu Bazlı SHAP Katkısı:")
+                for g, y, s in zip(grup_analiz["gruplar"],
+                                     grup_analiz["yuzdeler"],
+                                     grup_analiz["sayilar"]):
+                    bar = "█" * int(y / 2)
+                    print(f"    {g:<10} %{y:>5.1f}  {bar}  ({s} özellik)")
+                print(f"  → {GRAFIK_KLASOR}/feature_grup_analizi.png kaydedildi.")
+        except Exception as e:
+            print(f"  [UYARI] Feature group analizi atlandı: {e}")
+            grup_analiz = None
     except Exception as e:
         print(f"  [UYARI] SHAP budama başarısız: {e}")
         BUDANAN_OZELLIKLER = []
@@ -1670,6 +2150,26 @@ print(f"\n  FİNAL {len(secilen_algoritmalar)} ALGORİTMA: {secilen_algoritmalar
 print(f"  Paradigmalar: "
       f"{[ALGO_PARADIGMA[a] for a in secilen_algoritmalar]}")
 
+# [v5.1] Pipeline funnel diyagramı — 4-faz hiyerarşik mimari görseli
+_funnel_istatistikler = {
+    "n_train": N_TRAIN,
+    "n_test": N_TEST,
+    "n_ozellik_baslangic": int(len(OZELLIK)),
+    "n_ozellik_son": int(len(X_train.columns)),
+    "faz1_algos": len(ALGORITMALAR),
+    "faz1_kalan": len(hayatta_kalan),
+    "faz1_total_trial": int(sum(FAZ1_TRIAL_PER_ALGO.values())),
+    "faz2_secilen": len(secilen_algoritmalar),
+    "secilen_algos": secilen_algoritmalar,
+    "faz3_total_trial": int(sum(
+        FAZ3_TRIAL_PER_ALGO.get(a, 500) for a in secilen_algoritmalar
+    )),
+    "ensemble_uye_sayisi": FAZ2_SECILEN_SAYI * FAZ3_TOP_K,
+}
+yol = pipeline_funnel_diyagrami(_funnel_istatistikler)
+if yol:
+    print(f"  → {yol} kaydedildi (4-faz mimari)")
+
 # ══════════════════════════════════════════════════════════════════
 #  5. FAZ 3 — SEÇİLEN 3 ALGORİTMANIN DERİN TUNING'İ
 #     Her algoritma için bağımsız Optuna study (TPE multivariate)
@@ -1789,6 +2289,11 @@ for algo in secilen_algoritmalar:
     faz3_studies[algo] = study
     try:
         print(f"    En iyi CV skor: {study.best_value:.4f}")
+
+        # [v5.1] Trial convergence grafiği — sistematik araştırma kanıtı
+        yol = trial_convergence_grafigi(study, algo)
+        if yol:
+            print(f"    → {yol} kaydedildi (Optuna progress)")
     except Exception:
         pass
 
@@ -1946,6 +2451,8 @@ print(f"  {'─'*56}")
 print(f"\n[7/9] FAZ 4-B: {len(secilen_trials)} final model + test")
 
 final_test_proba_listesi = []
+# [v5.1] Tree-based final modelleri sakla (ensemble SHAP için)
+final_tree_modeller = []
 
 for i, (t, algo) in enumerate(zip(secilen_trials, secilen_trials_algo)):
     model_params = trial_to_model_params(algo, t.params, n_jobs_override=-1)
@@ -1978,6 +2485,10 @@ for i, (t, algo) in enumerate(zip(secilen_trials, secilen_trials_algo)):
         fm = model_fit_universal(algo, model_params, X_fin_tr, y_fin_tr,
                                   X_fin_es, y_fin_es)
         test_proba = predict_proba_universal(fm, algo, X_test)
+        # [v5.1] Tree-based modelleri sakla (SHAP için)
+        if algo in ("xgboost", "lightgbm", "catboost",
+                     "random_forest", "extra_trees"):
+            final_tree_modeller.append(fm)
     except Exception as e:
         print(f"\n    [UYARI] Final model başarısız ({e}), prior kullanılıyor.")
         test_proba = np.full(N_TEST, float(y_train.mean()))
@@ -2094,6 +2605,174 @@ print(f"    Patojenik F1        : {test_f1_path:.4f}")
 print(f"    KAÇIRILAN patojenik : {fn_count}  ←─ KLİNİK RİSK (false negative)")
 print(f"    Yanlış alarm        : {fp_count}  (gereksiz takip, false positive)")
 print(f"    Specificity (Benign): {test_spec:.4f}  ({tn_count}/{toplam_benign})")
+print("=" * 72)
+
+# ══════════════════════════════════════════════════════════════════
+#  7.5 [v4.5] BELİRSİZLİK + DİSAGREEMENT + YANLIŞ TAHMİN ANALİZİ
+#       Jüri için klinik akıllılık göstergeleri:
+#       - Per-örnek model belirsizliği (15 üye std)
+#       - Paradigma disagreement rate (3 algoritma)
+#       - Yanlış tahmin edilen örneklerin detaylı raporu
+# ══════════════════════════════════════════════════════════════════
+print(f"\n[7.5/9] [v4.5] KLİNİK BELİRSİZLİK + DİSAGREEMENT ANALİZİ")
+print("=" * 72)
+
+# ─── A. PER-ÖRNEK BELİRSİZLİK (Ensemble üyeleri arası std) ───
+# Tek bir test örneği için 15 üyenin standart sapması, modellerin
+# anlaşıp anlaşmadığını gösterir. Düşük std = güvenli, yüksek std = riskli.
+test_proba_matrix = np.array(final_test_proba_listesi)  # [15, 78]
+test_proba_std    = test_proba_matrix.std(axis=0)        # [78]
+test_proba_mean   = test_proba_matrix.mean(axis=0)
+guven_skoru       = 1.0 - test_proba_std                # 1 = mükemmel
+
+# Belirsizlik kategorileri
+DUSUK_BELIRSIZLIK_ESIK  = 0.10  # std < 0.10 → güvenli
+YUKSEK_BELIRSIZLIK_ESIK = 0.20  # std > 0.20 → riskli
+n_yuksek = int(np.sum(test_proba_std >= YUKSEK_BELIRSIZLIK_ESIK))
+n_orta   = int(np.sum((test_proba_std >= DUSUK_BELIRSIZLIK_ESIK) &
+                      (test_proba_std <  YUKSEK_BELIRSIZLIK_ESIK)))
+n_dusuk  = int(np.sum(test_proba_std <  DUSUK_BELIRSIZLIK_ESIK))
+
+print(f"\n  ── Model Belirsizliği (15 ensemble üyesi arası std) ──")
+print(f"    Güvenli tahmin   (std<{DUSUK_BELIRSIZLIK_ESIK:.2f}): {n_dusuk:>3} / {N_TEST}  ({n_dusuk/N_TEST*100:.1f}%)")
+print(f"    Orta belirsizlik ({DUSUK_BELIRSIZLIK_ESIK:.2f}-{YUKSEK_BELIRSIZLIK_ESIK:.2f}): {n_orta:>3} / {N_TEST}  ({n_orta/N_TEST*100:.1f}%)")
+print(f"    Yüksek belirsiz  (std>{YUKSEK_BELIRSIZLIK_ESIK:.2f}): {n_yuksek:>3} / {N_TEST}  ({n_yuksek/N_TEST*100:.1f}%)")
+print(f"    Ortalama std     : {test_proba_std.mean():.4f}")
+print(f"    Max std          : {test_proba_std.max():.4f}")
+
+# Yüksek belirsizlikli örnekler (klinik dikkat gerektirir)
+if n_yuksek > 0:
+    yuksek_idx = np.where(test_proba_std >= YUKSEK_BELIRSIZLIK_ESIK)[0]
+    print(f"\n    Yüksek belirsizlikli {n_yuksek} örnek (klinik tekrar değerlendirme önerisi):")
+    print(f"    {'Variant_ID':<20} {'Gerçek':<8} {'Tahmin':<8} {'Ort.Olas':<10} {'Std':<8}")
+    for idx in yuksek_idx[:10]:  # max 10 örnek göster
+        vid = str(variant_ids_test[idx])[:18]
+        gerc = "Patojenik" if y_test[idx] == 1 else "Benign"
+        tahm = "Patojenik" if test_tahminler[idx] == 1 else "Benign"
+        print(f"    {vid:<20} {gerc:<8} {tahm:<8} {test_proba_mean[idx]:<10.4f} {test_proba_std[idx]:<8.4f}")
+
+# ─── B. DISAGREEMENT RATE (3 Paradigma) ───
+# Her algoritma için kendi üye-ortalamasını al, sınıf tahminlerini karşılaştır.
+# Üye sırası ensemble_uyeleri'nde tutuluyor: [et,et,et,et,et,knn,knn,..,lr,lr,lr,lr,lr]
+print(f"\n  ── Paradigma Disagreement Rate (3 algoritma) ──")
+paradigma_proba = {}
+for algo_adi in secilen_algoritmalar:
+    algo_idxler = [i for i, u in enumerate(ensemble_uyeleri) if u["algo"] == algo_adi]
+    if algo_idxler:
+        algo_test_probas = test_proba_matrix[algo_idxler]   # [5, 78]
+        paradigma_proba[algo_adi] = algo_test_probas.mean(axis=0)
+
+# Her örnek için 3 paradigma tahmini
+paradigma_pred = {}
+for algo_adi, probas in paradigma_proba.items():
+    paradigma_pred[algo_adi] = (probas >= OPTIMAL_ESIK).astype(int)
+
+# Disagreement: 3 modelin tahmin sayısı eşit değilse fark vardır
+preds_array = np.array(list(paradigma_pred.values()))  # [3, 78]
+disagreement_per_ornek = np.array([
+    len(set(preds_array[:, i])) > 1 for i in range(N_TEST)
+])
+disagreement_count = int(disagreement_per_ornek.sum())
+disagreement_rate  = disagreement_count / N_TEST
+
+print(f"    Paradigmalar:     {list(paradigma_proba.keys())}")
+print(f"    Anlaşma sağlanan: {N_TEST - disagreement_count} / {N_TEST}  "
+      f"({(1-disagreement_rate)*100:.1f}%)")
+print(f"    Disagreement     : {disagreement_count} / {N_TEST}  "
+      f"({disagreement_rate*100:.1f}%) — ensemble bu noktalarda kritik karar veriyor")
+
+# Disagreement olan örneklerde ensemble doğruluğu
+if disagreement_count > 0:
+    dis_idx = np.where(disagreement_per_ornek)[0]
+    dis_dogru = int(np.sum(test_tahminler[dis_idx] == y_test[dis_idx]))
+    print(f"    Ensemble doğru   : {dis_dogru} / {disagreement_count}  "
+          f"({dis_dogru/disagreement_count*100:.1f}%) "
+          f"(paradigmaların anlaşmazlığında ensemble seçimi)")
+
+# ─── C. YANLIŞ TAHMİN TABLOSU ───
+# TEKNOFEST şartnamesi: "yanlış pozitif ve yanlış negatif sonuçlar
+# ayrıntılı olarak incelenmeli" — bu CSV doğrudan rapor 4. bölüm için.
+print(f"\n  ── Yanlış Tahmin Edilen Örnekler (Klinik Yorum İçin) ──")
+yanlis_idx = np.where(test_tahminler != y_test)[0]
+
+yanlis_kayitlar = []
+for idx in yanlis_idx:
+    yt = int(y_test[idx])
+    tp = int(test_tahminler[idx])
+    hata_tipi = "FN (KAÇIRILAN PATOJENİK)" if yt == 1 and tp == 0 else "FP (Yanlış Alarm)"
+
+    # SHAP referans modelinin yardımıyla en önemli 3 özellik (eğer mean_abs_shap mevcutsa)
+    try:
+        # X_test'te bu örneğin özellik değerleri
+        ornek_features = X_test.iloc[idx]
+        top3_shap_features = []
+        for rk in onem_sirasi[:3]:
+            if rk < len(all_cols):
+                fname = all_cols[rk]
+                if fname in ornek_features.index:
+                    fval = ornek_features[fname]
+                    if isinstance(fval, (int, float, np.integer, np.floating)):
+                        top3_shap_features.append(f"{fname}={float(fval):.3f}")
+                    else:
+                        top3_shap_features.append(f"{fname}={fval}")
+        top3_str = ", ".join(top3_shap_features) if top3_shap_features else "-"
+    except Exception:
+        top3_str = "-"
+
+    yanlis_kayitlar.append({
+        "variant_id":        str(variant_ids_test[idx]),
+        "gercek_etiket":     "Patojenik" if yt == 1 else "Benign",
+        "tahmin":            "Patojenik" if tp == 1 else "Benign",
+        "hata_tipi":         hata_tipi,
+        "ensemble_olasilik": round(float(final_test_proba[idx]), 4),
+        "model_belirsizlik": round(float(test_proba_std[idx]), 4),
+        "guven_skoru":       round(float(guven_skoru[idx]), 4),
+        "top3_ozellik":      top3_str,
+    })
+
+n_fn = sum(1 for r in yanlis_kayitlar if "FN" in r["hata_tipi"])
+n_fp = sum(1 for r in yanlis_kayitlar if "FP" in r["hata_tipi"])
+print(f"    Toplam yanlış: {len(yanlis_kayitlar)}  (FN: {n_fn}, FP: {n_fp})")
+
+if yanlis_kayitlar:
+    # Ekrana yazdır
+    print(f"\n    {'Variant_ID':<18} {'Gerçek':<10} {'Tahmin':<10} {'Hata':<25} {'Olas.':<7} {'Std':<7}")
+    print(f"    {'-'*18} {'-'*10} {'-'*10} {'-'*25} {'-'*7} {'-'*7}")
+    for r in yanlis_kayitlar:
+        vid_short = r["variant_id"][:16]
+        hata_short = r["hata_tipi"][:23]
+        print(f"    {vid_short:<18} {r['gercek_etiket']:<10} {r['tahmin']:<10} "
+              f"{hata_short:<25} {r['ensemble_olasilik']:<7.4f} {r['model_belirsizlik']:<7.4f}")
+
+# CSV kaydet (TEKNOFEST raporu 4. SONUÇ bölümü için)
+if yanlis_kayitlar:
+    yanlis_df = pd.DataFrame(yanlis_kayitlar)
+    yanlis_df.to_csv(f"yanlis_tahminler_{DATA_SUFFIX}.csv",
+                       index=False, encoding="utf-8")
+    print(f"\n  → yanlis_tahminler_{DATA_SUFFIX}.csv kaydedildi (rapor 4. bölümü için)")
+
+# [v5.1] Final Ensemble SHAP — gerçek karar mantığı (referans değil)
+print(f"\n  ── Final Ensemble SHAP Analizi ({len(final_tree_modeller)} tree üyesi) ──")
+if final_tree_modeller and SHAP_OK:
+    try:
+        # Daha hızlı çalışsın diye küçük örnek
+        X_test_sample = X_test.iloc[:min(30, len(X_test))]
+        ensemble_shap_sonuc = ensemble_shap_hesapla(
+            final_tree_modeller, X_train, X_test_sample
+        )
+        if ensemble_shap_sonuc:
+            print(f"    → {GRAFIK_KLASOR}/ensemble_shap.png kaydedildi")
+            print(f"    Top 5 özellik (final ensemble): "
+                  f"{', '.join(ensemble_shap_sonuc['top15_features'][:5])}")
+        else:
+            print(f"    [BİLGİ] Ensemble SHAP üretilemedi")
+    except Exception as e:
+        print(f"    [UYARI] Ensemble SHAP atlandı: {e}")
+        ensemble_shap_sonuc = None
+else:
+    print(f"    [BİLGİ] Tree-based model yok veya SHAP yüklü değil, atlandı")
+    ensemble_shap_sonuc = None
+
 print("=" * 72)
 
 # ══════════════════════════════════════════════════════════════════
@@ -2461,6 +3140,15 @@ print(f"    2. 3 farklı algoritmik paradigma birleşimi (genelleme garantisi)")
 print(f"    3. Isotonic kalibrasyon (klinik açıdan anlamlı olasılıklar)")
 if ci_cakisma:
     print(f"    4. İstatistiksel olarak en iyi solo modele EŞİT performans")
+
+# [v4.5] Klinik akıllılık metrikleri vurgusu
+print(f"\n  [v4.5] KLİNİK AKILLILIK GÖSTERGELERİ:")
+print(f"    • Per-örnek belirsizlik analizi: {n_yuksek}/{N_TEST} yüksek belirsizlikli "
+      f"(klinik tekrar değerlendirme önerisi)")
+print(f"    • Paradigma disagreement: %{disagreement_rate*100:.1f} "
+      f"(3 model anlaşmazlığında ensemble seçimi yapar)")
+print(f"    • Yanlış tahmin analizi: {len(yanlis_kayitlar)} örnek (FN: {n_fn}, FP: {n_fp})"
+      f" — yanlis_tahminler_{DATA_SUFFIX}.csv'de detaylı")
 print("═" * 88)
 
 # ══════════════════════════════════════════════════════════════════
@@ -2482,7 +3170,24 @@ for k in ["n_jobs", "thread_count", "verbosity", "verbose",
 
 sonuc = {
     "_aciklama": {
-        "surum"          : f"BioSense AI v4.3 — Çoklu Veri Seti + Cache ({DATA_SUFFIX.upper()})",
+        "surum"          : f"BioSense AI v5.1 — Jüri Etkisi 4 Yeni Görsel ({DATA_SUFFIX.upper()}, {CALISMA_MODU.upper()})",
+        "calisma_modu"   : CALISMA_MODU,
+        "sistem_profili" : {
+            "cpu_logical"     : int(_cpu_count_logical),
+            "cpu_physical"    : int(_cpu_count_physical),
+            "ram_total_gb"    : round(float(_total_ram_gb), 2),
+            "ram_available_gb": round(float(_available_ram_gb), 2),
+            "ram_kullanim_pct": round(float(_ram_kullanim_pct), 1),
+            "per_worker_gb"   : float(_per_worker_gb),
+            "paralel_isci"    : int(PARALEL_ISCI),
+            "gpu"             : GPU_BILGI,
+            "mod_trial_carpan": float(_c["trial"]),
+            "mod_fold_carpan" : float(_c["fold"]),
+            "faz1_trial_total": int(sum(FAZ1_TRIAL_PER_ALGO.values())),
+            "faz3_trial_total": int(sum(FAZ3_TRIAL_PER_ALGO.values())),
+            "faz1_fold_count" : int(FAZ1_FOLDS * FAZ1_TEKRAR),
+            "faz3_fold_count" : int(FAZ3_FOLDS * FAZ3_TEKRAR),
+        },
         "data_suffix"    : DATA_SUFFIX,
         "veri_dosyasi"   : VERI_DOSYASI,
         "pipeline"       : [
@@ -2600,6 +3305,32 @@ sonuc = {
         "yakalama_orani_pct"     : round(100.0 * tp_count / max(toplam_patojenik, 1), 2),
         "kacirilan_orani_pct"    : round(100.0 * fn_count / max(toplam_patojenik, 1), 2),
     },
+    "v45_klinik_analiz": {
+        "_aciklama": "v4.5: Per-örnek belirsizlik, paradigma disagreement, yanlış tahmin analizi",
+        "belirsizlik": {
+            "ortalama_std":     round(float(test_proba_std.mean()), 4),
+            "max_std":          round(float(test_proba_std.max()), 4),
+            "median_std":       round(float(np.median(test_proba_std)), 4),
+            "dusuk_belirsiz_n": int(n_dusuk),
+            "orta_belirsiz_n":  int(n_orta),
+            "yuksek_belirsiz_n": int(n_yuksek),
+            "dusuk_esik":       float(DUSUK_BELIRSIZLIK_ESIK),
+            "yuksek_esik":      float(YUKSEK_BELIRSIZLIK_ESIK),
+        },
+        "disagreement": {
+            "paradigmalar":       list(paradigma_proba.keys()),
+            "anlasma_n":          int(N_TEST - disagreement_count),
+            "disagreement_n":     int(disagreement_count),
+            "disagreement_rate":  round(float(disagreement_rate), 4),
+            "ensemble_dogru_dis": int(np.sum(test_tahminler[disagreement_per_ornek] == y_test[disagreement_per_ornek])) if disagreement_count > 0 else 0,
+        },
+        "yanlis_tahminler": yanlis_kayitlar,
+        "yanlis_ozet": {
+            "toplam": len(yanlis_kayitlar),
+            "false_negatives": int(n_fn),
+            "false_positives": int(n_fp),
+        },
+    },
     "solo_vs_ensemble": {
         "_aciklama": "v4.0: TEKNOFEST jüri sunum için solo modellerin tek başına "
                      "test performansları. Bootstrap %95 CI çakışması istatistiksel "
@@ -2636,13 +3367,18 @@ print(f"  '{CIKTI_FAZ1_CSV}' (FAZ 1 tablosu)")
 print(f"  '{CIKTI_KORELASYON_CSV}' (FAZ 2 korelasyon matrisi)")
 print(f"  'solo_vs_ensemble_{DATA_SUFFIX}.csv' (v4.0 jüri karşılaştırması)")
 print(f"  'karar_esigi_tablosu_{DATA_SUFFIX}.csv' (v4.1 TEKNOFEST zorunlu)")
-print(f"  '{GRAFIK_KLASOR}/' klasöründe 8 PNG görsel:")
-print(f"     - shap_top_ozellikler.png")
-print(f"     - faz1_algoritma_karsilastirma.png")
-print(f"     - faz2_korelasyon_heatmap.png")
-print(f"     - cm_ensemble.png + cm_solo_*.png (4 adet)")
-print(f"     - solo_vs_ensemble.png")
-print(f"     - roc_pr_curves.png")
+if yanlis_kayitlar:
+    print(f"  'yanlis_tahminler_{DATA_SUFFIX}.csv' (v4.5 klinik yorum)")
+if SHAP_OK and os.path.exists(SHAP_CACHE_PATH):
+    print(f"  '{SHAP_CACHE_PATH}' (v4.5 SHAP cache, sonraki run'larda 2 dk tasarruf)")
+print(f"  '{GRAFIK_KLASOR}/' klasöründe 12+ PNG görsel:")
+print(f"     [v4.1] shap_top_ozellikler.png, faz1_algoritma_karsilastirma.png")
+print(f"     [v4.1] faz2_korelasyon_heatmap.png, cm_*.png (4 adet)")
+print(f"     [v4.1] solo_vs_ensemble.png, roc_pr_curves.png")
+print(f"     [v5.1] pipeline_funnel.png (4-faz mimari)")
+print(f"     [v5.1] trial_convergence_*.png (3 algoritma için)")
+print(f"     [v5.1] feature_grup_analizi.png (pasta + bar)")
+print(f"     [v5.1] ensemble_shap.png (gerçek karar mantığı)")
 print("\n" + "=" * 72)
-print(f"  BioSense AI v4.3 — TAMAMLANDI ({DATA_SUFFIX.upper()})")
+print(f"  BioSense AI v5.1 — TAMAMLANDI ({DATA_SUFFIX.upper()}, MOD: {CALISMA_MODU.upper()})")
 print("=" * 72)
