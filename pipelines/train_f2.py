@@ -1,6 +1,16 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  BioSense AI v4.2 — CPU %100 KULLANIM (Algoritma-bazlı paralellik)          ║
+║  BioSense AI v4.3 — ÇOKLU VERİ SETİ DESTEĞİ + Performans Cache              ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  v4.2 → v4.3 EKLEMESİ:                                                       ║
+║   ✓ DATA_SUFFIX argümanı: python script.py kanser / cftr / pah / master     ║
+║   ✓ Tüm dosya isimleri suffix'li (JSON, DB, CSV, görsel klasörü)            ║
+║      → 4 veri seti karışmadan paralel çalışabilir                           ║
+║   ✓ multiprocessing.cpu_count() ile dinamik PARALEL_ISCI                    ║
+║      → 16/24/32 core'lu makinelerde otomatik uyum                           ║
+║   ✓ Bootstrap iter sayısı dinamik (test boyutuna göre 800-2000)             ║
+║   ✓ Solo modellerin probs cache → görsel üretiminde reuse (~5 dk tasarruf)  ║
+║                                                                              ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  v4.1 → v4.2 DÜZELTMESİ — CPU verim sorunu çözüldü:                         ║
 ║   ✓ FIX O: Algoritmaya göre paralellik stratejisi                           ║
@@ -159,12 +169,34 @@ warnings.filterwarnings("ignore")
 # ══════════════════════════════════════════════════════════════════
 #  KONTROL PANELİ
 # ══════════════════════════════════════════════════════════════════
-VERI_DOSYASI   = "YARISMA_TRAIN_KANSER.csv"
-CIKTI_JSON     = "en_iyi_parametreler_v3.json"
-CIKTI_FAZ1_CSV = "faz1_algoritma_kiyaslama.csv"
-CIKTI_KORELASYON_CSV = "faz2_korelasyon_matrisi.csv"
+import sys
+# [v4.3] Veri seti adı komut satırından alınır: python script.py kanser / master / cftr / pah
+DATA_SUFFIX = sys.argv[1].lower() if len(sys.argv) > 1 else "kanser"
+print(f"  >>> Çalıştırılan veri seti: {DATA_SUFFIX.upper()}")
 
-PARALEL_ISCI   = 24
+# Veri dosyası isim haritası (yarışma standardı)
+_DATA_FILE_MAP = {
+    "kanser": "YARISMA_TRAIN_KANSER.csv",
+    "cftr":   "YARISMA_TRAIN_CFTR.csv",
+    "pah":    "YARISMA_TRAIN_PAH.csv",
+    "master": "YARISMA_TRAIN_MASTER.csv",
+}
+VERI_DOSYASI   = _DATA_FILE_MAP.get(DATA_SUFFIX,
+                                     f"YARISMA_TRAIN_{DATA_SUFFIX.upper()}.csv")
+
+# Tüm çıktı dosya isimleri suffix'li — 4 veri seti çakışmasın diye
+CIKTI_JSON     = f"en_iyi_parametreler_{DATA_SUFFIX}_v4.json"
+CIKTI_FAZ1_CSV = f"faz1_algoritma_kiyaslama_{DATA_SUFFIX}.csv"
+CIKTI_KORELASYON_CSV = f"faz2_korelasyon_matrisi_{DATA_SUFFIX}.csv"
+
+# [v4.3] PARALEL_ISCI dinamik (24-core sabitten kurtulduk)
+import multiprocessing
+try:
+    PARALEL_ISCI = min(multiprocessing.cpu_count(), 24)
+    print(f"  >>> Tespit edilen logical core: {multiprocessing.cpu_count()}, "
+          f"PARALEL_ISCI: {PARALEL_ISCI}")
+except Exception:
+    PARALEL_ISCI = 8
 
 # [FIX O] Algoritmaya göre paralellik stratejisi (CPU %10 problemini çözer)
 # Sorun: 24 dış worker × 24 iç thread = 576 thread → GIL bottleneck + DB lock
@@ -199,7 +231,7 @@ FAZ1_TRIAL_PER_ALGO = {
     "naive_bayes":    5,    # çok az hiperparametre
     "mlp":           80,
 }
-FAZ1_DB_PREFIX = "sqlite:///biosense_faz1_v3"
+FAZ1_DB_PREFIX = f"sqlite:///biosense_faz1_v4_{DATA_SUFFIX}"
 
 # FAZ 1 eleme kriterleri (3'ü AYNI ANDA sağlanırsa elenir)
 FAZ1_F2_ORT_ESIK    = 0.70   # F2 ortalama bu altındaysa
@@ -237,7 +269,7 @@ FAZ3_TRIAL_PER_ALGO = {
 }
 FAZ3_FOLDS          = 5
 FAZ3_TEKRAR         = 10     # 50 fold
-FAZ3_DB_PREFIX      = "sqlite:///biosense_faz3_v3"
+FAZ3_DB_PREFIX      = f"sqlite:///biosense_faz3_v4_{DATA_SUFFIX}"
 FAZ3_TOP_K          = 5      # her algo'dan ensemble'a ekle
 
 # ── FAZ 4: Ensemble + Test ────────────────────────────────────────
@@ -299,7 +331,7 @@ PREPROCESSING_GEREK = {
 }
 
 print("=" * 72)
-print("  BioSense AI v4.2 — CPU %100 (Algoritma-bazlı paralellik)")
+print("  BioSense AI v4.3 — ÇOKLU VERİ SETİ + Cache + Dinamik Bootstrap")
 print(f"  Toplam algoritma havuzu: {len(TUM_ALGORITMALAR)}")
 print(f"  FAZ 1: {sum(FAZ1_TRIAL_PER_ALGO.get(a, 30) for a in TUM_ALGORITMALAR)} "
       f"trial × {FAZ1_FOLDS*FAZ1_TEKRAR} fold")
@@ -417,7 +449,24 @@ def softmax_agirliklar(f2_dizi, sicaklik=10.0):
     exp_z = np.exp(z)
     return exp_z / exp_z.sum()
 
-def bootstrap_metric_ci(y_true, y_proba_or_pred, metric_func, n_boot=2000,
+def bootstrap_iter_count(test_size):
+    """
+    [v4.3] Test set boyutuna göre dinamik Bootstrap iterasyon sayısı.
+    - Küçük test (<150): 2000 iter (varyans yüksek, çok iter şart)
+    - Orta test (150-500): 1500 iter
+    - Büyük test (500-1500): 1000 iter
+    - Çok büyük (>1500): 800 iter (yeterli precision)
+    """
+    if test_size < 150:
+        return 2000
+    elif test_size < 500:
+        return 1500
+    elif test_size < 1500:
+        return 1000
+    else:
+        return 800
+
+def bootstrap_metric_ci(y_true, y_proba_or_pred, metric_func, n_boot=None,
                          alpha=0.05, threshold=None, random_state=43):
     """
     Bootstrap yüzdelik yöntemiyle herhangi bir metriğin güven aralığı.
@@ -438,6 +487,9 @@ def bootstrap_metric_ci(y_true, y_proba_or_pred, metric_func, n_boot=2000,
         (mean, lower_95ci, upper_95ci) tuple
     """
     n = len(y_true)
+    # [v4.3] n_boot None ise test boyutuna göre dinamik
+    if n_boot is None:
+        n_boot = bootstrap_iter_count(n)
     rng = np.random.default_rng(random_state)
     scores = []
     for _ in range(n_boot):
@@ -463,7 +515,7 @@ def rank_ensemble(proba_listesi):
 #  v4.1: GÖRSEL ÜRETİM FONKSİYONLARI (TEKNOFEST raporu için)
 # ══════════════════════════════════════════════════════════════════
 
-GRAFIK_KLASOR = "grafikler"
+GRAFIK_KLASOR = f"grafikler_{DATA_SUFFIX}"
 if MATPLOTLIB_OK and not os.path.exists(GRAFIK_KLASOR):
     os.makedirs(GRAFIK_KLASOR)
 
@@ -1965,7 +2017,8 @@ else:
     tn = fp = fn = tp = 0
 
 # ─── BOOTSTRAP 95% GÜVEN ARALIKLARI (JÜRİ İÇİN İSTATİSTİKSEL RİGOR) ─────
-print("\n  Bootstrap 95% Güven Aralıkları (2000 iterasyon)...")
+_b_iter = bootstrap_iter_count(len(y_test))
+print(f"\n  Bootstrap 95% Güven Aralıkları ({_b_iter} iterasyon, test_n={len(y_test)})...")
 _, test_f2_lo, test_f2_hi = bootstrap_metric_ci(
     y_test, final_test_proba,
     lambda yt, yp: fbeta_score(yt, yp, beta=2, pos_label=1,
@@ -2178,6 +2231,9 @@ def _solo_evaluate(model_adi, fit_fn, predict_fn):
             "true_negatives": int(tn),
             "optimal_esik": float(esik),
             "egitim_suresi_s": round(dt, 1),
+            # [v4.3] Görsel üretiminde reuse için probs cache (memory-only)
+            "_test_probs": test_probs,
+            "_test_pred":  test_pred,
         }
     except Exception as e:
         print(f"  ── {model_adi:<22} HATA: {type(e).__name__}: {e}")
@@ -2279,10 +2335,15 @@ ensemble_satiri = {
 }
 karsilastirma_listesi = solo_sonuclari + [ensemble_satiri]
 
-# CSV kaydet
-df_karsi = pd.DataFrame(karsilastirma_listesi)
+# CSV kaydet (probs cache field'larını CSV'ye yazma)
+_CSV_HARIC_FIELDS = ("_test_probs", "_test_pred")
+def _csv_temiz(row):
+    return {k: v for k, v in row.items() if k not in _CSV_HARIC_FIELDS}
+
+df_karsi = pd.DataFrame([_csv_temiz(r) for r in karsilastirma_listesi])
 df_karsi_sirali = df_karsi.sort_values("test_f2", ascending=False).reset_index(drop=True)
-df_karsi.to_csv("solo_vs_ensemble.csv", index=False, encoding="utf-8")
+# [v4.3] CSV dosya adına DATA_SUFFIX
+df_karsi.to_csv(f"solo_vs_ensemble_{DATA_SUFFIX}.csv", index=False, encoding="utf-8")
 
 # ─────────────────────────────────────────────────────────────────
 # v4.1: GÖRSELLER — TEKNOFEST raporu için zorunlu
@@ -2294,40 +2355,25 @@ confusion_matrix_gorseli(y_test, test_tahminler,
                           "ENSEMBLE (4-faz pipeline)",
                           "cm_ensemble.png")
 
-# 2. Solo modeller için CM (sadece eğitilmiş olanlar — yeniden eğitmek
-# pahalı, en iyi 2 solo için yapalım)
+# 2. Solo modeller için CM (FAZ 8.5'te cache'lenmiş probs'u kullan,
+# YENİDEN EĞİTMEYE GEREK YOK — v4.3 optimizasyonu, ~5 dk tasarruf)
 en_iyi_3_solo = sorted(solo_sonuclari, key=lambda x: x.get("test_f2", 0),
                         reverse=True)[:3]
 
 # v4.1: Initialize — en_iyi_solo_probs hiç atanmazsa (tüm try'lar fail)
-# 'dir()' check'i fragile olduğu için açıkça None ile başlatıyoruz.
 en_iyi_solo_probs = None
 en_iyi_solo_ad    = None
 
 for i, s in enumerate(en_iyi_3_solo):
     ad = s["model"]
-    print(f"  → {ad} CM hesaplanıyor (yeniden tahmin)...")
-    # Modeli yeniden eğit ve tahmin yap (probs gerekiyor, depolamadık)
+    # [v4.3] Probs zaten _solo_evaluate'da hesaplandı, cache'den al
+    if "_test_probs" not in s or "_test_pred" not in s:
+        print(f"  → {ad} CM atlandı (probs cache yok, hata olmuş olabilir)")
+        continue
+    print(f"  → {ad} CM çiziliyor (cache'den, yeniden eğitim yok)...")
     try:
-        if "CatBoost" in ad and CB_OK:
-            m = _solo_fit_cb()
-            probs = _solo_pred_cb(m, X_test)
-        elif "ExtraTrees" in ad:
-            m = _solo_fit_et()
-            probs = _solo_pred_et(m, X_test)
-        elif "LightGBM" in ad and LGBM_OK:
-            m = _solo_fit_lgb()
-            probs = _solo_pred_lgb(m, X_test)
-        elif "Random Forest" in ad:
-            m = _solo_fit_rf()
-            probs = _solo_pred_rf(m, X_test)
-        elif "XGBoost" in ad:
-            m = _solo_fit_xgb()
-            probs = _solo_pred_xgb(m, X_test)
-        else:
-            continue
-        esik = s["optimal_esik"]
-        pred = (probs >= esik).astype(int)
+        probs = s["_test_probs"]
+        pred  = s["_test_pred"]
         # Confusion matrix
         guvenli_ad = ad.replace(" ", "_").replace("(", "").replace(")", "")
         confusion_matrix_gorseli(y_test, pred, ad,
@@ -2336,8 +2382,6 @@ for i, s in enumerate(en_iyi_3_solo):
         if i == 0:
             en_iyi_solo_probs = probs
             en_iyi_solo_ad    = ad
-        del m
-        gc.collect()
     except Exception as e:
         print(f"    [UYARI] {ad} CM atlandı: {e}")
 
@@ -2369,9 +2413,9 @@ for r in esik_sonuc:
           f"{r['Recall']:>7.4f} {r['Precision']:>10.4f} {r['MCC']:>7.4f} "
           f"{r['TP']:>3} {r['FP']:>3} {r['FN']:>3} {r['TN']:>3}")
 # Karar eşiği tablosunu CSV olarak da kaydet
-pd.DataFrame(esik_sonuc).to_csv("karar_esigi_tablosu.csv",
+pd.DataFrame(esik_sonuc).to_csv(f"karar_esigi_tablosu_{DATA_SUFFIX}.csv",
                                    index=False, encoding="utf-8")
-print(f"\n  → karar_esigi_tablosu.csv kaydedildi (rapor için).")
+print(f"\n  → karar_esigi_tablosu_{DATA_SUFFIX}.csv kaydedildi (rapor için).")
 
 # ══════════════════════════════════════════════════════════════════
 #  TEKNOFEST JÜRİ SUNUM BLOKU — Hibrit Karşılaştırma
@@ -2438,7 +2482,9 @@ for k in ["n_jobs", "thread_count", "verbosity", "verbose",
 
 sonuc = {
     "_aciklama": {
-        "surum"          : "BioSense AI v4.2 — CPU %100 + Tam Pipeline (FIX O)",
+        "surum"          : f"BioSense AI v4.3 — Çoklu Veri Seti + Cache ({DATA_SUFFIX.upper()})",
+        "data_suffix"    : DATA_SUFFIX,
+        "veri_dosyasi"   : VERI_DOSYASI,
         "pipeline"       : [
             "Faz 1: 10 algo geniş tarama + hibrit istatistiksel eleme",
             "Faz 2: Korelasyon + greedy çeşitlilik seçimi → top 3",
@@ -2588,9 +2634,9 @@ with open(CIKTI_JSON, "w", encoding="utf-8") as f:
 print(f"  '{CIKTI_JSON}' kaydedildi.")
 print(f"  '{CIKTI_FAZ1_CSV}' (FAZ 1 tablosu)")
 print(f"  '{CIKTI_KORELASYON_CSV}' (FAZ 2 korelasyon matrisi)")
-print(f"  'solo_vs_ensemble.csv' (v4.0 jüri karşılaştırması)")
-print(f"  'karar_esigi_tablosu.csv' (v4.1 TEKNOFEST zorunlu)")
-print(f"  'grafikler/' klasöründe 8 PNG görsel:")
+print(f"  'solo_vs_ensemble_{DATA_SUFFIX}.csv' (v4.0 jüri karşılaştırması)")
+print(f"  'karar_esigi_tablosu_{DATA_SUFFIX}.csv' (v4.1 TEKNOFEST zorunlu)")
+print(f"  '{GRAFIK_KLASOR}/' klasöründe 8 PNG görsel:")
 print(f"     - shap_top_ozellikler.png")
 print(f"     - faz1_algoritma_karsilastirma.png")
 print(f"     - faz2_korelasyon_heatmap.png")
@@ -2598,5 +2644,5 @@ print(f"     - cm_ensemble.png + cm_solo_*.png (4 adet)")
 print(f"     - solo_vs_ensemble.png")
 print(f"     - roc_pr_curves.png")
 print("\n" + "=" * 72)
-print("  BioSense AI v4.2 — TAMAMLANDI")
+print(f"  BioSense AI v4.3 — TAMAMLANDI ({DATA_SUFFIX.upper()})")
 print("=" * 72)
