@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  BioSense AI v7.5 — Yarışma-Hazır Trial+Fold (PAH 6h → 15dk)            ║
+║  BioSense AI v7.7 — TEKNOFEST Forensik: Kategorik Force + Stratified Bootstrap            ║
 ║  Sağlıkta Yapay Zeka Yarışması — Üniversite Kategorisi                      ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║                                                                              ║
@@ -236,6 +236,13 @@ except ImportError:
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 warnings.filterwarnings("ignore")
+# [v7.6] sklearn 1.8+ FutureWarning spam'ini sustur (log temizliği)
+warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn")
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+# Worker process'lerine de uygula
+import os as _os
+_os.environ["PYTHONWARNINGS"] = "ignore"
 
 # ══════════════════════════════════════════════════════════════════
 #  KONTROL PANELİ
@@ -852,23 +859,31 @@ RASTGELE_TOHUM = 43
 # [v6.3] Naive Bayes havuzdan çıkarıldı:
 #   - F2 ~0.17 her zaman → jüri için "anormal düşük" alarmı
 #   - Sınıf bağımsızlık varsayımı genomik veride yapısal olarak ihlal ediliyor
-#   - Bu beklenen başarısızlık raporda 1 cümleyle açıklanır,
-#     pipeline'da yer kaplamasına gerek yok
-# Eğer NB tekrar dahil edilmek istenirse: ENABLE_NAIVE_BAYES=True yapılır
+# [v7.6] MLP varsayılan olarak çıkarıldı:
+#   - PAH'da F2=0.87 (diğerleri 0.96-0.97) — ensemble'ı zehirliyor
+#   - Küçük data (300-400 örnek) için sinir ağı zaten uygun değil
+#   - lbfgs solver bile küçük data'da overfitting yapıyor
+#   - Eğer KANSER için MLP gerekirse: ENABLE_MLP=True yap
 ENABLE_NAIVE_BAYES = False  # [v6.3] Yarışma sunumu için kapalı
+ENABLE_MLP         = False  # [v7.6] Yarışma sunumu için kapalı
 
 TUM_ALGORITMALAR = ["xgboost"]
 if LGBM_OK: TUM_ALGORITMALAR.append("lightgbm")
 if CB_OK:   TUM_ALGORITMALAR.append("catboost")
 TUM_ALGORITMALAR.extend([
     "random_forest", "extra_trees",
-    "logistic", "svm_rbf", "knn", "mlp",
+    "logistic", "svm_rbf", "knn",
 ])
+if ENABLE_MLP:
+    TUM_ALGORITMALAR.append("mlp")
+    print(f"  [v7.6] MLP dahil edildi (ENABLE_MLP=True)")
+else:
+    print(f"  [v7.6] MLP havuzdan çıkarıldı (küçük data + ensemble zararı)")
 if ENABLE_NAIVE_BAYES:
     TUM_ALGORITMALAR.insert(-1, "naive_bayes")
     print(f"  [v6.3] Naive Bayes dahil edildi (ENABLE_NAIVE_BAYES=True)")
 else:
-    print(f"  [v6.3] Naive Bayes havuzdan çıkarıldı (yarışma için, 9 algoritma kaldı)")
+    print(f"  [v6.3] Naive Bayes havuzdan çıkarıldı (yarışma için)")
 
 # Algoritma → paradigma haritası (sunum tablosu için)
 ALGO_PARADIGMA = {
@@ -902,7 +917,7 @@ PREPROCESSING_GEREK = {
 }
 
 print("=" * 72)
-print("  BioSense AI v7.5 — Yarışma-Hazır Trial+Fold (PAH 6h → 15dk) + Per-Trial Progress + Cache Hız")
+print("  BioSense AI v7.7 — TEKNOFEST Forensik: Kategorik Force + Stratified Bootstrap + Per-Trial Progress + Cache Hız")
 print(f"  Toplam algoritma havuzu: {len(TUM_ALGORITMALAR)}")
 print(f"  FAZ 1: {sum(FAZ1_TRIAL_PER_ALGO.get(a, 30) for a in TUM_ALGORITMALAR)} "
       f"trial × {FAZ1_FOLDS*FAZ1_TEKRAR} fold")
@@ -922,49 +937,91 @@ df      = pd.read_csv(VERI_DOSYASI)
 HEDEF   = "Label"
 OZELLIK = [c for c in df.columns if c not in ["Variant_ID", HEDEF]]
 
-tek_tip = [c for c in OZELLIK if df[c].nunique() <= 1]
-if tek_tip:
-    df.drop(columns=tek_tip, inplace=True)
-    OZELLIK = [c for c in df.columns if c not in ["Variant_ID", HEDEF]]
-    print(f"  {len(tek_tip)} sıfır-varyanslı kolon silindi.")
-
-X  = df[OZELLIK].copy()
+# [v7.6 KRİTİK FIX] Veri sızıntısı önlemi — Split ÖNCE, transform SONRA
+# Eski: tüm 372 satırda sıfır-varyans hesabı → test bilgisi train'e sızıyordu
+# Yeni: önce split, sonra SADECE train üzerinde transform, test'e uygula
+X_full = df[OZELLIK].copy()
 le = LabelEncoder()
 y  = le.fit_transform(df[HEDEF])
 
-# [FIX G] Pozitif sınıf hangi etikete karşılık geliyor? Yanlış yorumlama
-# riskine karşı açıkça yazdır. F2 metriği class 1'i pozitif kabul eder.
 print(f"  Label haritalama: '{le.classes_[0]}' → 0 (negatif), "
       f"'{le.classes_[1]}' → 1 (POZİTİF, F2 hedefi)")
-if "patho" in str(le.classes_[1]).lower() or "malign" in str(le.classes_[1]).lower():
+_c0, _c1 = str(le.classes_[0]).lower(), str(le.classes_[1]).lower()
+if "patho" in _c1 or "malign" in _c1 or "pos" in _c1:
     print(f"  ✓ Pozitif sınıf doğru (Pathogenic/Malignant tarafı)")
-elif "patho" in str(le.classes_[0]).lower() or "malign" in str(le.classes_[0]).lower():
-    print(f"  ⚠ UYARI: Pozitif sınıf (1) muhtemelen YANLIŞ tarafta! "
-          f"Pathogenic class 0'a düşmüş. Etiketleri kontrol edin veya "
-          f"y = 1 - y ile ters çevirin.")
+elif "patho" in _c0 or "malign" in _c0 or "pos" in _c0:
+    print(f"  🚨 KRİTİK UYARI: Pozitif sınıf (1) YANLIŞ tarafta! "
+          f"Patojenik='{le.classes_[0]}' class 0'a düşmüş.")
+    print(f"     ÇÖZÜM: CSV'de Label'ı kontrol edin veya kod başında y = 1 - y yapın.")
+elif _c0 in ("0", "1") and _c1 in ("0", "1"):
+    # Sayısal label — konvansiyon: 1=pozitif=patojenik
+    print(f"  ⚠ Label SAYISAL ('0'/'1'). Konvansiyon: '1' = patojenik (pozitif) varsayıldı.")
+    print(f"     LÜTFEN DOĞRULAYIN: Dataset'te Label=1 gerçekten PATOJENİK mi?")
+    print(f"     Yanlışsa F2 metriği tamamen ters yönde optimize eder!")
+else:
+    print(f"  ⚠ Pozitif sınıf belirsiz: '{le.classes_[1]}'. Manuel doğrulama önerilir.")
 
-KAT_KOLONLAR = []
-for col in X.columns:
-    if (X[col].dtype == "object" or X[col].dtype.name == "category"
-            or str(col).startswith("CAT_") or str(col).startswith("AA_")):
-        # [FIX M] Kategorik kolonlardaki float NaN'lar CatBoost tarafından
-        # okunamıyordu (CatBoost cat_features parametresinde float NaN'ı
-        # kabul etmez). Onları "EKSİK" string'i ile dolduralım — CatBoost
-        # bunu ayrı bir kategori olarak ele alır, tree-numeric / non-tree
-        # algos da numerik kodlama sırasında bu kategoriyi doğru işler.
-        # v3.4 run'da CatBoost crash'inin asıl sebebi buydu.
-        X[col] = X[col].fillna("EKSİK").astype(str).astype("category")
-        KAT_KOLONLAR.append(col)
-
-# [v4.5] Variant_ID'leri de split et — yanlış tahmin tablosu için
+# Variant_ID'leri ayır
 _variant_ids_all = df["Variant_ID"].values if "Variant_ID" in df.columns else \
                    np.array([f"VAR_{i}" for i in range(len(df))])
+
+# ÖNCE SPLİT — test seti hiçbir transform'da kullanılmamalı
 X_train, X_test, y_train, y_test, variant_ids_train, variant_ids_test = train_test_split(
-    X, y, _variant_ids_all,
+    X_full, y, _variant_ids_all,
     test_size=TEST_ORANI, random_state=RASTGELE_TOHUM, stratify=y
 )
 y_train = np.array(y_train)
 y_test  = np.array(y_test)
+
+# [v7.6 SIZINTI KONTROLÜ] Variant_ID çakışması kontrolü
+_train_ids = set(map(str, variant_ids_train))
+_test_ids  = set(map(str, variant_ids_test))
+_kesisim = _train_ids & _test_ids
+if _kesisim:
+    print(f"  🚨 KRİTİK SIZINTI: {len(_kesisim)} Variant_ID train ve test'te ÇAKIŞIYOR!")
+    print(f"     Örnek çakışan ID'ler: {list(_kesisim)[:5]}")
+    raise ValueError("Veri sızıntısı tespit edildi — duplicate Variant_ID")
+else:
+    print(f"  ✓ Sızıntı kontrolü: train/test Variant_ID çakışması YOK ({len(_train_ids)} train, {len(_test_ids)} test)")
+
+# Sıfır-varyans kolonlar SADECE TRAIN'den hesaplanır
+tek_tip = [c for c in OZELLIK if X_train[c].nunique() <= 1]
+if tek_tip:
+    X_train = X_train.drop(columns=tek_tip)
+    X_test  = X_test.drop(columns=tek_tip)
+    OZELLIK = [c for c in X_train.columns]
+    print(f"  {len(tek_tip)} sıfır-varyanslı kolon silindi (TRAIN-only hesaplandı).")
+
+# Kategorik kolonlar — TRAIN'den kategori SETİ öğren, TEST'e force et
+# [v7.7 TEKNOFEST KRİTİK FIX] Eski v7.6'da X_train ve X_test ayrı astype("category")
+# çağrılıyordu — bu KATEGORİLER FARKLI öğrenmesine yol açıyor.
+# Örnek: train {A,B,C,EKSİK}, test {A,C} → model 4 boyut öğrenir test'te 3 boyut.
+# Bu CatBoost/LightGBM'i bozar, test predictions tutarsız olur.
+# Çözüm: TRAIN'de kategori setini öğren, TEST'i pd.Categorical(..., categories=...) ile force et.
+KAT_KOLONLAR = []
+_kat_kategoriler = {}  # train'den öğrenilen kategoriler (test'e force etmek için)
+for col in X_train.columns:
+    if (X_train[col].dtype == "object" or X_train[col].dtype.name == "category"
+            or str(col).startswith("CAT_") or str(col).startswith("AA_")):
+        # Train'de fillna + astype("category")
+        X_train[col] = X_train[col].fillna("EKSİK").astype(str).astype("category")
+        # Train'den kategori setini sakla
+        _kat_kategoriler[col] = X_train[col].cat.categories
+        # Test'te aynı kategorilere FORCE et (pandas-safe: set_categories)
+        _test_col = X_test[col].fillna("EKSİK").astype(str).astype("category")
+        # Train'de görülmemiş kategorileri "EKSİK"e indirge
+        _gecersiz = ~_test_col.isin(_kat_kategoriler[col])
+        if _gecersiz.any():
+            n_yeni = int(_gecersiz.sum())
+            print(f"  [v7.7] {col}: test'te {n_yeni} train'de görülmemiş kategori → 'EKSİK'")
+            _test_col = _test_col.astype(str)
+            _test_col[_gecersiz.values] = "EKSİK"
+        # Train kategori setine sabitle (aynı kodlama uzayı)
+        X_test[col] = pd.Categorical(_test_col,
+                                      categories=_kat_kategoriler[col])
+        KAT_KOLONLAR.append(col)
+print(f"  [v7.7] Kategorik kolonlar TRAIN→TEST aynı kategori seti ile encode edildi "
+      f"({len(KAT_KOLONLAR)} kolon)")
 
 SPW     = float((y_train == 0).sum()) / max(float((y_train == 1).sum()), 1)
 N_TRAIN = len(X_train)
@@ -976,6 +1033,28 @@ N_FEATURES_EFFECTIVE = N_FEATURES   # SHAP sonrası güncellenecek
 print(f"  Train: {N_TRAIN} | Test (kilitli): {N_TEST} | SPW: {SPW:.3f}")
 print(f"  Özellik: {N_FEATURES} ({len(KAT_KOLONLAR)} kategorik)")
 print(f"  Sınıf dağılımı: {dict(zip(*np.unique(y, return_counts=True)))}")
+
+# [v7.6 SIZINTI KONTROL — Test set sınıf dengesi]
+# Test pozitif oranı çok yüksekse F2 yanıltıcı olur.
+# Naive "her şey pozitif" baseline F2'sini hesapla → modelimiz bunu geçmeli.
+_test_pos_orani = float((y_test == 1).sum()) / len(y_test)
+_train_pos_orani = float((y_train == 1).sum()) / len(y_train)
+print(f"\n  ── SINIF DAĞILIMI ANALİZİ ──")
+print(f"  Train pozitif oranı: {_train_pos_orani:.3f} ({(y_train==1).sum()}/{len(y_train)})")
+print(f"  Test pozitif oranı : {_test_pos_orani:.3f} ({(y_test==1).sum()}/{len(y_test)})")
+
+# Naive baseline F2 hesabı: "her şeyi pozitif" derse
+# Precision = pos_orani, Recall = 1.0
+# F2 = 5·P·R / (4·P + R) = 5·pos_orani / (4·pos_orani + 1)
+_naive_f2 = 5.0 * _test_pos_orani / (4.0 * _test_pos_orani + 1.0)
+print(f"  ⚠ NAIVE BASELINE F2 (her şeyi pozitif): {_naive_f2:.4f}")
+if _test_pos_orani > 0.70:
+    print(f"  🚨 KRİTİK: Test set %{_test_pos_orani*100:.0f} pozitif — F2 yanıltıcı olabilir!")
+    print(f"     Modelin F2 değeri {_naive_f2:.4f}'ten ÇOK daha yüksek olmalı.")
+    print(f"     Specificity (TN/N) ve MCC daha güvenilir metrikler.")
+
+# Naive baseline'ı globalde tut — sonra final test sonucu ile karşılaştır
+NAIVE_F2_BASELINE = _naive_f2
 
 # [v7.2] İş yükü uyarısı — RAM çökme riskini engelle
 _is_yuku = N_TRAIN * N_FEATURES
@@ -1114,19 +1193,32 @@ def _bootstrap_vektorize_f2(y_true, y_proba_or_pred, n_boot, threshold,
                             random_state, alpha=0.05):
     """[v7.0] NUMPY VEKTÖRIZE F2 Bootstrap — 60x+ hızlanma.
 
-    Klasik Python for-loop yerine tüm 2000 iterasyonu (n_boot, n) shape'li
-    matris ile tek seferde hesaplar. NumPy SIMD ile CPU sayısından bağımsız hızlı.
+    [v7.7 STRATIFIED FIX] İmbalanced data (örn PAH %83 pozitif, 13 negatif)
+    için STRATIFIED bootstrap. Rastgele resample bazı iterasyonlarda 0 negatif
+    çekebilir → F2/CI bozulur. Stratified: her sınıftan orantılı örnekleme.
 
     F-beta = (1+β²)·TP / ((1+β²)·TP + β²·FN + FP),  β=2 → F2
-
     Test: 2629ms (sıralı) → 41ms (vektörize) = 63.6x, sonuçlar identik.
     """
     n = len(y_true)
     rng = np.random.default_rng(random_state)
-    # (n_boot, n) shape — tüm boot örneklerini tek seferde
-    idx = rng.integers(0, n, (n_boot, n))
-    y_t = y_true[idx]              # (n_boot, n) gerçek etiketler
-    y_p_raw = y_proba_or_pred[idx] # (n_boot, n) tahminler/proba
+
+    # [v7.7] STRATIFIED bootstrap — pozitif ve negatif indeksleri ayrı resample
+    pos_idx = np.where(y_true == 1)[0]
+    neg_idx = np.where(y_true == 0)[0]
+    n_pos, n_neg = len(pos_idx), len(neg_idx)
+
+    if n_pos > 0 and n_neg > 0:
+        # Her sınıftan kendi boyutu kadar resample → sınıf oranı korunur
+        boot_pos = rng.choice(pos_idx, (n_boot, n_pos), replace=True)
+        boot_neg = rng.choice(neg_idx, (n_boot, n_neg), replace=True)
+        idx = np.concatenate([boot_pos, boot_neg], axis=1)  # (n_boot, n)
+    else:
+        # Tek sınıf varsa düz resample (fallback)
+        idx = rng.integers(0, n, (n_boot, n))
+
+    y_t = y_true[idx]
+    y_p_raw = y_proba_or_pred[idx]
 
     if threshold is not None:
         y_p = (y_p_raw >= threshold).astype(int)
@@ -1756,7 +1848,17 @@ def ensemble_shap_hesapla(final_modeller_tree, X_train, X_test_sample,
                         m, feature_perturbation="tree_path_dependent"
                     )
                 # check_additivity=False — küçük floating point hataları affet
-                sv = explainer.shap_values(X_for_shap, check_additivity=False)
+                # [v7.6] LightGBM categorical mismatch fix: önce float X ile dene,
+                # hata gelirse ORIJINAL X (kategorik bilgisi korunarak) dene
+                try:
+                    sv = explainer.shap_values(X_for_shap, check_additivity=False)
+                except Exception as cat_err:
+                    if "categorical_feature" in str(cat_err):
+                        # Orijinal kategorik X ile dene
+                        sv = explainer.shap_values(X_test_sample,
+                                                    check_additivity=False)
+                    else:
+                        raise
                 if isinstance(sv, list):
                     sv = sv[1]
                 elif hasattr(sv, "ndim") and sv.ndim == 3:
@@ -1950,7 +2052,7 @@ def model_olustur(algo, params, X_tr_sample=None):
 
     elif algo == "mlp":
         p.setdefault("random_state", RASTGELE_TOHUM)
-        p.setdefault("max_iter", 2000)
+        p.setdefault("max_iter", 500)
         p.setdefault("early_stopping", True)
         p.setdefault("validation_fraction", 0.15)
         return Pipeline([("imputer", SimpleImputer(strategy="median")),
@@ -2186,7 +2288,7 @@ def suggest_params(trial, algo, geniş=True):
             "gamma":             trial.suggest_float("xgb_gamma", 0.0, 8.0),
             "reg_alpha":         trial.suggest_float("xgb_alpha", 0.0, 15.0),
             "reg_lambda":        trial.suggest_float("xgb_lambda", 0.1, 30.0),
-            "scale_pos_weight":  trial.suggest_float("xgb_spw", SPW*0.2, SPW*6.0),
+            "scale_pos_weight":  trial.suggest_float("xgb_spw", SPW*0.5, SPW*2.0),
             "enable_categorical": True, "tree_method": "hist", "device": XGB_DEVICE,
             # [v7.0] max_bin optimize: küçük data N<800 için 128 yeterli, 1.76x hızlanma
             "max_bin": 128 if (
@@ -2209,7 +2311,7 @@ def suggest_params(trial, algo, geniş=True):
             "reg_alpha":         trial.suggest_float("lgb_alpha", 0.0, 15.0),
             "reg_lambda":        trial.suggest_float("lgb_lambda", 0.1, 30.0),
             "min_split_gain":    trial.suggest_float("lgb_msg", 0.0, 5.0),
-            "scale_pos_weight":  trial.suggest_float("lgb_spw", SPW*0.2, SPW*6.0),
+            "scale_pos_weight":  trial.suggest_float("lgb_spw", SPW*0.5, SPW*2.0),
             "verbosity": -1, "random_state": RASTGELE_TOHUM, "n_jobs": lgb_inner_nj,
             "subsample_freq": 1,
             # [v7.0] LGB max_bin küçük data için 128 (default 255)
@@ -2244,7 +2346,7 @@ def suggest_params(trial, algo, geniş=True):
             "min_data_in_leaf":  trial.suggest_int("cb_mdl", 1, 50),
             "subsample":         trial.suggest_float("cb_sub", 0.35, 1.00),
             "colsample_bylevel": trial.suggest_float("cb_cbl", 0.40, 1.00),
-            "scale_pos_weight":  trial.suggest_float("cb_spw", SPW*0.2, SPW*6.0),
+            "scale_pos_weight":  trial.suggest_float("cb_spw", SPW*0.5, SPW*2.0),
             "border_count":      border_cnt,
             "random_seed": RASTGELE_TOHUM, "thread_count": cb_inner_nj, "verbose": False,
         }
@@ -2357,7 +2459,7 @@ def suggest_params(trial, algo, geniş=True):
                 "alpha":              trial.suggest_float("mlp_alpha", 1e-5, 1e-1,
                                                            log=True),
                 "solver":             "lbfgs",
-                "max_iter":           2000,
+                "max_iter":           500,
                 "max_fun":            15000,  # lbfgs'a özgü
                 "random_state":       RASTGELE_TOHUM,
             }
@@ -2374,7 +2476,7 @@ def suggest_params(trial, algo, geniş=True):
                 "batch_size":         trial.suggest_categorical("mlp_bs",
                                                                  [32, 64, "auto"]),
                 "solver":             "adam",
-                "max_iter":           2000,
+                "max_iter":           500,
                 "early_stopping":     True,
                 "validation_fraction": 0.15,
                 "random_state":       RASTGELE_TOHUM,
@@ -2997,10 +3099,11 @@ print(f"  → grafikler/faz2_korelasyon_heatmap.png kaydedildi.")
 #
 # Sonuç: CatBoost, LightGBM gibi güçlü modeller seçilebilir. Korelasyon
 # yine ceza ama F2'yi domine etmiyor.
-FAZ2_F2_ALT_SINIR_TOLERANS = 0.025    # en_iyi F2'den 0.025 düşük olana kadar kabul
-FAZ2_KORELASYON_AGIRLIGI   = 0.15     # additive ceza katsayısı
+FAZ2_F2_ALT_SINIR_TOLERANS = 0.005    # [v7.6] 0.025 → 0.005 (sıkı)
+FAZ2_KORELASYON_AGIRLIGI   = 0.05     # [v7.6] 0.15 → 0.05 (F2 dominant)
+FAZ2_TOP_K_HAVUZ           = 5        # [v7.6] sadece en iyi 5'ten seç
 
-print("\n  Greedy Çeşitlilik Seçimi (v6.0: F2 alt sınır + additive bileşik):")
+print("\n  Greedy Çeşitlilik Seçimi (v7.6: SIKI F2 alt sınır + minimal ceza):")
 
 secilen_algoritmalar = []
 en_iyi_f2_algo = max(oof_f2_per_algo, key=oof_f2_per_algo.get)
@@ -3010,39 +3113,47 @@ F2_ALT_SINIR = en_iyi_f2_genel - FAZ2_F2_ALT_SINIR_TOLERANS
 print(f"    En iyi OOF F2: {en_iyi_f2_genel:.4f} ({en_iyi_f2_algo})")
 print(f"    F2 alt sınır:  {F2_ALT_SINIR:.4f} (tolerans={FAZ2_F2_ALT_SINIR_TOLERANS})")
 
-# Adayları F2 alt sınıra göre filtrele
-adaylar_kalitelli = [a for a in hayatta_kalan
-                      if oof_f2_per_algo[a] >= F2_ALT_SINIR]
-elenenler = [a for a in hayatta_kalan
-              if oof_f2_per_algo[a] < F2_ALT_SINIR]
+# [v7.6] EN İYİ K ALGORİTMA HAVUZUNDAN seç (zayıf model girmesin)
+sirali_algo = sorted(hayatta_kalan, key=lambda a: oof_f2_per_algo[a], reverse=True)
+top_k_havuz = sirali_algo[:FAZ2_TOP_K_HAVUZ]
+print(f"    Top-{FAZ2_TOP_K_HAVUZ} havuz (en yüksek F2): {top_k_havuz}")
 
-print(f"    F2 alt sınırını geçen: {len(adaylar_kalitelli)} algoritma "
+# Adaylar: top-K içinde VE F2 alt sınırını geçen
+adaylar_kalitelli = [a for a in top_k_havuz
+                      if oof_f2_per_algo[a] >= F2_ALT_SINIR]
+elenenler = [a for a in hayatta_kalan if a not in adaylar_kalitelli]
+
+print(f"    F2 alt sınırını geçen (top-K içinde): {len(adaylar_kalitelli)} algoritma "
       f"({', '.join(adaylar_kalitelli)})")
 if elenenler:
-    print(f"    F2 alt sınırının altında: {len(elenenler)} algoritma "
-          f"({', '.join(elenenler)}) — çeşitlilik seçimine alınmayacak")
+    print(f"    Elenen: {len(elenenler)} algoritma "
+          f"({', '.join(elenenler)})")
 
-# Adım 1: En yüksek F2'li (alt sınırı geçen) algoritma
+# [v7.6] Yeterli aday yoksa toleransı gevşet (en az 3 algoritma seç)
+if len(adaylar_kalitelli) < FAZ2_SECILEN_SAYI:
+    print(f"    [UYARI] Yeterli aday yok ({len(adaylar_kalitelli)} < {FAZ2_SECILEN_SAYI}), "
+          f"top-{FAZ2_SECILEN_SAYI}'e genişletiliyor")
+    adaylar_kalitelli = sirali_algo[:FAZ2_SECILEN_SAYI]
+
+# Adım 1: En yüksek F2'li algoritma
 secilen_algoritmalar.append(en_iyi_f2_algo)
 print(f"    1. {en_iyi_f2_algo.upper()} (en yüksek F2: {en_iyi_f2_genel:.4f})")
 
-# Adım 2+: Additive bileşik ile çeşitlilik seçimi
+# Adım 2+: Additive bileşik ile çeşitlilik seçimi (DÜŞÜK korelasyon ağırlığı)
 while len(secilen_algoritmalar) < FAZ2_SECILEN_SAYI:
     adaylar = [a for a in adaylar_kalitelli if a not in secilen_algoritmalar]
     if not adaylar:
-        # Alt sınırı geçen aday kalmadı, geri kalan tüm hayatta kalanlardan seç
         adaylar = [a for a in hayatta_kalan if a not in secilen_algoritmalar]
         if not adaylar:
             break
         print(f"    [UYARI] F2 alt sınırı tükendi, geri kalanlardan seçiliyor")
 
-    # Her aday için seçilenlerle ortalama korelasyonu hesapla
     ort_kor = {}
     for a in adaylar:
         kor_listesi = [abs(korelasyon_df.loc[a, s]) for s in secilen_algoritmalar]
         ort_kor[a] = float(np.mean(kor_listesi))
 
-    # YENİ: bilesik = F2 - α × ort_kor (additive)
+    # bilesik = F2 - α × ort_kor (α=0.05 düşük, F2 dominant)
     bilesik = {a: oof_f2_per_algo[a] - FAZ2_KORELASYON_AGIRLIGI * ort_kor[a]
                 for a in adaylar}
     en_iyi = max(bilesik, key=bilesik.get)
@@ -3561,6 +3672,31 @@ print(f"    Patojenik F1        : {test_f1_path:.4f}")
 print(f"    KAÇIRILAN patojenik : {fn_count}  ←─ KLİNİK RİSK (false negative)")
 print(f"    Yanlış alarm        : {fp_count}  (gereksiz takip, false positive)")
 print(f"    Specificity (Benign): {test_spec:.4f}  ({tn_count}/{toplam_benign})")
+print("=" * 72)
+
+# [v7.6 KRİTİK SIZINTI/TRIVIAL DETECTOR] Naive baseline ile karşılaştır
+# Eğer test seti çok dengesiz (örn %83 pozitif), "her şey pozitif" baseline F2 ≈ 0.96.
+# Modelin GERÇEK katma değerini AKILLILIK SKORU ile ölç:
+#   akıllılık = (model_F2 - naive_F2) / (1 - naive_F2)
+#   +1.0 → mükemmel iyileşme, 0 → naive'le aynı, -X → naive'den kötü
+print("\n  ── [v7.6] NAIVE BASELINE KARŞILAŞTIRMASI ──")
+print(f"  Naive baseline F2 ('her şey pozitif')  : {NAIVE_F2_BASELINE:.4f}")
+print(f"  Ensemble F2 (model)                    : {test_f2:.4f}")
+_akillilik = (test_f2 - NAIVE_F2_BASELINE) / max(1.0 - NAIVE_F2_BASELINE, 1e-6)
+print(f"  AKILLILIK SKORU                        : {_akillilik:+.4f}")
+if _akillilik < 0:
+    print(f"  🚨 KRİTİK: Model NAIVE baseline'dan KÖTÜ — F2 metriği yanıltıcı.")
+    print(f"     PAH gibi imbalanced datada AUC/MCC/Specificity bakılmalı.")
+elif _akillilik < 0.10:
+    print(f"  ⚠ Marjinal model: naive'den çok az iyi. Specificity'e dikkat.")
+else:
+    print(f"  ✓ Model naive baseline'ı anlamlı şekilde geçti.")
+
+# Specificity uyarısı — model "trivial" çözüme kayıyor mu?
+if test_spec < 0.50:
+    print(f"\n  🚨 SPECIFICITY {test_spec:.3f} < 0.50: Model {toplam_benign} benign örneğin "
+          f"yarıdan azını doğru tahmin ediyor!")
+    print(f"     scale_pos_weight çok yüksek olabilir — sınıf dengesi bozuk.")
 print("=" * 72)
 
 # ══════════════════════════════════════════════════════════════════
@@ -4124,7 +4260,7 @@ for k in ["n_jobs", "thread_count", "verbosity", "verbose",
 
 sonuc = {
     "_aciklama": {
-        "surum"          : f"BioSense AI v7.5 — Yarışma-Hazır Trial+Fold (PAH 6h → 15dk) + Per-Trial Progress ({DATA_SUFFIX.upper()}, {CALISMA_MODU.upper()})",
+        "surum"          : f"BioSense AI v7.7 — TEKNOFEST Forensik: Kategorik Force + Stratified Bootstrap + Per-Trial Progress ({DATA_SUFFIX.upper()}, {CALISMA_MODU.upper()})",
         "calisma_modu"   : CALISMA_MODU,
         "sistem_profili" : {
             "cpu_logical"     : int(_cpu_count_logical),
@@ -4334,5 +4470,5 @@ print(f"     [v5.1] trial_convergence_*.png (3 algoritma için)")
 print(f"     [v5.1] feature_grup_analizi.png (pasta + bar)")
 print(f"     [v5.1] ensemble_shap.png (gerçek karar mantığı)")
 print("\n" + "=" * 72)
-print(f"  BioSense AI v7.5 — TAMAMLANDI ({DATA_SUFFIX.upper()}, MOD: {CALISMA_MODU.upper()})")
+print(f"  BioSense AI v7.7 — TAMAMLANDI ({DATA_SUFFIX.upper()}, MOD: {CALISMA_MODU.upper()})")
 print("=" * 72)
