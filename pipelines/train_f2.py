@@ -1,132 +1,8 @@
-"""
-╔══════════════════════════════════════════════════════════════════════════════╗
-║  BioSense AI v7.9 — İmbalanced FAZ2 (MCC+AUC) + Akıllı Metodoloji Tercihi            ║
-║  Sağlıkta Yapay Zeka Yarışması — Üniversite Kategorisi                      ║
-╠══════════════════════════════════════════════════════════════════════════════╣
-║                                                                              ║
-║  ─── KULLANIM (Akıllı CLI — Pozisyondan Bağımsız) ───                       ║
-║   python biosense_v6.1_ultra.py                                              ║
-║      → Otomatik veri seti tespiti + DEFAULT mod + GPU varsa AKTİF           ║
-║   python biosense_v6.1_ultra.py kanser                                      ║
-║      → KANSER + interactive mod seçimi                                       ║
-║   python biosense_v6.1_ultra.py kanser ultra                                ║
-║      → KANSER ULTRA + cihaz otomatik                                        ║
-║   python biosense_v6.1_ultra.py kanser ultra cpu                            ║
-║      → KANSER ULTRA + CPU zorla (GPU varsa bile kullanmaz)                  ║
-║   python biosense_v6.1_ultra.py kanser ultra cuda                           ║
-║      → KANSER ULTRA + CUDA zorla (KANSER'de bile GPU kullanır)              ║
-║   python biosense_v6.1_ultra.py master fast cuda > log.txt 2>&1             ║
-║      → MASTER FAST CUDA, log dosyaya yazılır                                 ║
-║                                                                              ║
-║  ─── ARGÜMAN SIRASI ─── (pozisyondan bağımsız, akıllı tespit)               ║
-║   veri_seti : kanser | cftr | pah | master                                  ║
-║   mod       : fast | default | ultra                                        ║
-║   cihaz     : cpu | cuda | auto                                              ║
-║                                                                              ║
-║  ─── v6.3 → v6.4 PARALELLİK ÇÖZÜMÜ (Optuna Resmi Tavsiye) ──                ║
-║   📚 ARAŞTIRMA: Optuna FAQ resmi olarak söylüyor —                          ║
-║      "n_jobs CPU-bound işte GIL nedeniyle çalışmaz, process-based gerekli"  ║
-║      (https://optuna.readthedocs.io/en/stable/faq.html)                     ║
-║      → Optuna v2.7'den beri n_jobs threading deprecate edildi               ║
-║                                                                              ║
-║   ⭐ ÇÖZÜM: joblib loky backend ile FOLD-level paralelleme                  ║
-║      - oof_tahmin_universal içinde Parallel(n_jobs=22, backend="loky")      ║
-║      - Loky process-based → GIL bypass → gerçek CPU paralel                 ║
-║      - Memmap shared data → bellek kopyalama yok                            ║
-║      - Otomatik fallback: loky başarısızsa sıralıya geçer                   ║
-║                                                                              ║
-║   ⭐ BEKLENEN ETKİ:                                                         ║
-║      FAZ 2 CatBoost OOF: 1008s → ~50-80s (~12-20x hızlanma)                ║
-║      FAZ 2 toplam: 22 dakika → ~3 dakika                                    ║
-║      FAZ 4-A OOF (15 üye): 7-8 dakika → ~30 saniye                          ║
-║      Toplam pipeline süresinde ~20-30 dakika tasarruf                       ║
-║                                                                              ║
-║   ⚠ FAZ 1/3 Optuna trial-içi: Pruner+trial.report cross-process imkansız    ║
-║      → Şimdilik dokunulmadı, mevcut yapı korundu                            ║
-║      → Trial bütçesi düşürmek (v6.3) zaten %60 hızlanma sağladı             ║
-║                                                                              ║
-║  ─── v6.2 → v6.3 OPTİMİZASYON KALİBRESİ (KORUNAN) ───                       ║
-║   ⭐ FAZ 3 TRIAL BÜTÇELERİ DÜŞÜRÜLDÜ (en büyük etki, %60 daha hızlı):       ║
-║     LightGBM 1500→600, XGBoost 1500→600, CatBoost 1000→400                  ║
-║     ExtraTrees 500→300, RF 500→300, MLP 800→400                             ║
-║     Optuna pratiği: TPE 300-500 trial'da yakınsar, fazlası overkill         ║
-║                                                                              ║
-║   ⭐ ULTRA mod ÇARPANLARI DENGELENDİ:                                       ║
-║     trial: 1.5 → 1.0 (zaten BASE yeterli yüksek)                            ║
-║     fold:  1.2 → 1.0 (50 fold istatistiksel olarak yeterli)                 ║
-║     iter:  1.1 (korundu — n_estimators artırma kaldı)                       ║
-║                                                                              ║
-║   ⭐ NAIVE BAYES havuzdan ÇIKARILDI:                                        ║
-║     F2~0.17 jüri için "anormal" alarm                                       ║
-║     Yapısal sınırlama: sınıf bağımsızlık varsayımı genomik için ihlal       ║
-║     Raporda 1 cümleyle açıklanır                                            ║
-║                                                                              ║
-║   ⭐ CACHE LOG NETLEŞTİRİLDİ:                                               ║
-║     [CACHE] DB'de N trial var (COMPLETE/PRUNED/FAIL ayrımı)                 ║
-║     [CACHE] Hedef X, kalan Y trial → yeni trial neden çalıştırıldığı net    ║
-║                                                                              ║
-║   ⚠ PARALELLEME: Outer Optuna n_jobs=22 etkili değil (GIL nedeniyle)         ║
-║      → Çözüm gelecek versiyona ertelendi (multiprocessing refactor riskli)  ║
-║      → Şu anki çözüm: trial sayısı düşürerek toplam süreyi azaltmak         ║
-║                                                                              ║
-║  ─── v6.1 → v6.2 PERFORMANS FIX (KORUNAN) ───                                ║
-║                                                                              ║
-║  ─── v6.0 → v6.1 EKLEMESİ ───                                                ║
-║   ⭐ Akıllı argv parser (pozisyon bağımsız)                                 ║
-║   ⭐ Otomatik veri seti tespiti (klasördeki ilk YARISMA_TRAIN_*.csv)         ║
-║   ⭐ Manuel cihaz seçimi (cpu/cuda/auto)                                    ║
-║   ⭐ Hiç argüman yoksa tam otomatik mod                                     ║
-║                                                                              ║
-║  ─── v5.2 → v6.0 KORUNAN ─── (TEKNOFEST için kritik):                       ║
-║   ⭐ FAZ 2 mantığı düzeltildi: F2 alt sınır + additive bileşik              ║
-║   ⭐ GPU otomatik (KANSER CPU, MASTER CUDA)                                 ║
-║   ⭐ Ensemble SHAP bug fix                                                  ║
-║   ⭐ Eşik MCC tie-break, Softmax sıcaklık 25                                ║
-║                                                                              ║
-║   ✓ Trial Convergence: Her FAZ 3 algoritması için Optuna progress eğrisi    ║
-║     → "Sistematik araştırma" kanıtı                                          ║
-║   ✓ Pipeline Funnel: 4-faz hiyerarşik mimari görseli                        ║
-║     → Word SmartArt yerine otomatik üretiliyor                              ║
-║   ✓ Feature Group Analysis: Prefix bazlı SHAP dağılımı (pasta + bar)        ║
-║     → "Hangi özellik grubu kararı yönlendiriyor?"                            ║
-║   ✓ Final Ensemble SHAP: 5 tree üyesinin ortalama SHAP'i                    ║
-║     → Referans modelin değil, gerçek karar mantığı                          ║
-║                                                                              ║
-║  ─── KULLANIM ───                                                           ║
-║  python script.py <veri_seti> [mod]                                         ║
-║    veri_seti : kanser | cftr | pah | master                                  ║
-║    mod       : fast | default | ultra  (opsiyonel — sorulur)                ║
-║                                                                              ║
-║  Örnek: python script.py kanser ultra                                       ║
-║                                                                              ║
-║  ─── ÇALIŞMA MODLARI (Kullanıcı Seçer) ───                                  ║
-║   FAST    → Trial ×0.5, Fold ×0.5   (~10-15 dk, test/geliştirme)            ║
-║   DEFAULT → Trial ×1.0, Fold ×1.0   (~25-40 dk, dengeli)                    ║
-║   ULTRA   → Trial ×1.5, Fold ×1.2   (~50-90 dk, yarışma teslimi)            ║
-║                                                                              ║
-║  ─── DONANIM TESPİTİ (Otomatik) ───                                         ║
-║   • PARALEL_ISCI çekirdek sayısından otomatik (RAM safety margin)            ║
-║   • Sistem profili kutu olarak gösterilir                                    ║
-║   • GPU tespiti bilgi amaçlı (CUDA hâlâ manuel)                              ║
-║                                                                              ║
-║  ─── PIPELINE MİMARİSİ ───                                                  ║
-║   FAZ 1 : 10 algoritma geniş tarama → istatistiksel eleme                   ║
-║   FAZ 2 : Korelasyon + greedy çeşitlilik seçimi → 3 paradigma               ║
-║   FAZ 3 : Seçilen 3 algoritma için derin Optuna tuning                      ║
-║   FAZ 4 : Top-5×3 = 15 üye ensemble + isotonic kalibrasyon                  ║
-║   FAZ 7.5 : Klinik akıllılık — belirsizlik, disagreement, yanlış tahmin    ║
-║   FAZ 8.5 : Solo vs Ensemble hibrit karşılaştırma (TEKNOFEST İLK)           ║
-║                                                                              ║
-║  ─── DESTEKLENEN METRİKLER (TEKNOFEST Şartnamesi) ───                       ║
-║   Zorunlu : F1, MCC, PR-AUC                                                 ║
-║   Klinik  : Binary F2, Patojenik recall/precision, FN/FP analizi            ║
-║   Rigor   : Bootstrap %95 CI (dinamik iter, test boyutuna göre)             ║
-║                                                                              ║
-║  Tarihçe detayları: biosense_gelistirme_tarihce.md                          ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-"""
+"""BioSense AI F2 training pipeline. Launch via ../train.py.
 
-
+Adapted from biosense_ai_v7.9.py; original snapshots are preserved in Git history.
+This module executes training at top level: do not import it as a library.
+"""
 import os, sys, json, time, warnings, gc
 
 # [FIX K] Windows CMD/PowerShell default encoding cp1254 (Türkçe) bazı
@@ -252,21 +128,21 @@ import sys
 # [v6.1] AKILLI CLI PARSER — 3 opsiyonel argüman
 # ════════════════════════════════════════════════════════════════════
 # Kullanım:
-#   python biosense_v6.1_ultra.py                       → tam otomatik
+#   python train_f2.py                       → tam otomatik
 #       (klasördeki ilk YARISMA_TRAIN_*.csv, DEFAULT mod, CUDA varsa)
-#   python biosense_v6.1_ultra.py kanser                → KANSER + sorar mod
-#   python biosense_v6.1_ultra.py kanser ultra          → KANSER ULTRA + CUDA otomatik
-#   python biosense_v6.1_ultra.py kanser ultra cpu      → KANSER ULTRA CPU
-#   python biosense_v6.1_ultra.py kanser ultra cuda     → KANSER ULTRA CUDA (zorla)
+#   python train_f2.py kanser                → KANSER + sorar mod
+#   python train_f2.py kanser ultra          → KANSER ULTRA + CUDA otomatik
+#   python train_f2.py kanser ultra cpu      → KANSER ULTRA CPU
+#   python train_f2.py kanser ultra cuda     → KANSER ULTRA CUDA (zorla)
 # ════════════════════════════════════════════════════════════════════
 
 # --help argümanı
 if any(arg in ("--help", "-h", "help") for arg in sys.argv[1:]):
     print("""
-BioSense AI v6.1 — TEKNOFEST Variant Patojenite Tahmini
+BioSense AI F2 — TEKNOFEST Variant Patojenite Tahmini
 
 KULLANIM:
-  python biosense_v6.1_ultra.py [veri_seti] [mod] [cihaz]
+  python train_f2.py [veri_seti] [mod] [cihaz]
 
 ARGÜMANLAR (pozisyondan bağımsız, hepsi opsiyonel):
   veri_seti : kanser | cftr | pah | master
@@ -277,16 +153,16 @@ ARGÜMANLAR (pozisyondan bağımsız, hepsi opsiyonel):
               (yazılmazsa: KANSER için CPU, diğerleri için CUDA varsa AKTİF)
 
 ÖRNEKLER:
-  python biosense_v6.1_ultra.py
+  python train_f2.py
       → Klasördeki ilk veri seti, DEFAULT mod, GPU varsa CUDA
 
-  python biosense_v6.1_ultra.py kanser ultra
+  python train_f2.py kanser ultra
       → KANSER ULTRA mod, KANSER için CPU otomatik
 
-  python biosense_v6.1_ultra.py master fast cuda
+  python train_f2.py master fast cuda
       → MASTER FAST mod, CUDA zorla
 
-  python biosense_v6.1_ultra.py kanser ultra cpu > log.txt 2>&1
+  python train_f2.py kanser ultra cpu > log.txt 2>&1
       → KANSER ULTRA CPU, çıktı log dosyasına
 
 ENV DEĞIŞKENLERİ:
@@ -294,7 +170,7 @@ ENV DEĞIŞKENLERİ:
   BIOSENSE_CIHAZ=cpu    → cihaz ön ayarı
 
 DAHA FAZLA:
-  https://github.com/teknofest (proje deposu)
+  README.md ve docs/USAGE.md
 """)
     sys.exit(0)
 
@@ -313,7 +189,7 @@ _DATA_FILE_MAP = {
 def _otomatik_veri_seti_tespit():
     """Klasörde ilk bulunan YARISMA_TRAIN_*.csv'yi tespit et."""
     import glob
-    aday_csvler = sorted(glob.glob("YARISMA_TRAIN_*.csv"))
+    aday_csvler = sorted(glob.glob(os.path.join(os.environ.get("BIOSENSE_DATA_DIR", "."), "YARISMA_TRAIN_*.csv")))
     if not aday_csvler:
         return None
     # İsmi normalize et: YARISMA_TRAIN_KANSER.csv → "kanser"
@@ -353,6 +229,9 @@ else:
 
 VERI_DOSYASI = _DATA_FILE_MAP.get(DATA_SUFFIX,
                                     f"YARISMA_TRAIN_{DATA_SUFFIX.upper()}.csv")
+
+# Public launcher keeps private input separate from generated outputs.
+VERI_DOSYASI = os.path.join(os.environ.get("BIOSENSE_DATA_DIR", "."), VERI_DOSYASI)
 
 # Env fallback cihaz tercihi
 if _KULLANICI_CIHAZ is None:
