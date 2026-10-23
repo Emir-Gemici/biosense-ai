@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  BioSense AI v6.3 — Optimizasyon Kalibresi + NB Çıkar + Cache Log           ║
+║  BioSense AI v6.4 — Loky Process-Parallel (Optuna Resmi Tavsiye)            ║
 ║  Sağlıkta Yapay Zeka Yarışması — Üniversite Kategorisi                      ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║                                                                              ║
@@ -23,7 +23,29 @@
 ║   mod       : fast | default | ultra                                        ║
 ║   cihaz     : cpu | cuda | auto                                              ║
 ║                                                                              ║
-║  ─── v6.2 → v6.3 KRİTİK KALİBRASYON ───                                     ║
+║  ─── v6.3 → v6.4 PARALELLİK ÇÖZÜMÜ (Optuna Resmi Tavsiye) ──                ║
+║   📚 ARAŞTIRMA: Optuna FAQ resmi olarak söylüyor —                          ║
+║      "n_jobs CPU-bound işte GIL nedeniyle çalışmaz, process-based gerekli"  ║
+║      (https://optuna.readthedocs.io/en/stable/faq.html)                     ║
+║      → Optuna v2.7'den beri n_jobs threading deprecate edildi               ║
+║                                                                              ║
+║   ⭐ ÇÖZÜM: joblib loky backend ile FOLD-level paralelleme                  ║
+║      - oof_tahmin_universal içinde Parallel(n_jobs=22, backend="loky")      ║
+║      - Loky process-based → GIL bypass → gerçek CPU paralel                 ║
+║      - Memmap shared data → bellek kopyalama yok                            ║
+║      - Otomatik fallback: loky başarısızsa sıralıya geçer                   ║
+║                                                                              ║
+║   ⭐ BEKLENEN ETKİ:                                                         ║
+║      FAZ 2 CatBoost OOF: 1008s → ~50-80s (~12-20x hızlanma)                ║
+║      FAZ 2 toplam: 22 dakika → ~3 dakika                                    ║
+║      FAZ 4-A OOF (15 üye): 7-8 dakika → ~30 saniye                          ║
+║      Toplam pipeline süresinde ~20-30 dakika tasarruf                       ║
+║                                                                              ║
+║   ⚠ FAZ 1/3 Optuna trial-içi: Pruner+trial.report cross-process imkansız    ║
+║      → Şimdilik dokunulmadı, mevcut yapı korundu                            ║
+║      → Trial bütçesi düşürmek (v6.3) zaten %60 hızlanma sağladı             ║
+║                                                                              ║
+║  ─── v6.2 → v6.3 OPTİMİZASYON KALİBRESİ (KORUNAN) ───                       ║
 ║   ⭐ FAZ 3 TRIAL BÜTÇELERİ DÜŞÜRÜLDÜ (en büyük etki, %60 daha hızlı):       ║
 ║     LightGBM 1500→600, XGBoost 1500→600, CatBoost 1000→400                  ║
 ║     ExtraTrees 500→300, RF 500→300, MLP 800→400                             ║
@@ -1798,17 +1820,45 @@ def predict_proba_universal(model, algo, X_in):
 #  OOF FONKSİYONU (10 ALGORİTMA İÇİN BİRLEŞİK)
 # ══════════════════════════════════════════════════════════════════
 
+def _oof_fold_worker(args):
+    """[v6.4] OOF fold worker — module-level (loky picklable).
+
+    Tek fold için: train_split → ES split → fit → predict_proba
+    Returns: (val_idx, prob) tuple
+
+    Worker process içinde global'lar yok — her şey args ile gönderilir.
+    """
+    (algo, params, X_ft, y_ft, X_fv, X_es, y_es,
+     n_jobs_override) = args
+    try:
+        m = model_fit_universal(algo, params, X_ft, y_ft, X_es, y_es,
+                                n_jobs_override=n_jobs_override)
+        prob = predict_proba_universal(m, algo, X_fv)
+        return (True, prob)
+    except Exception:
+        return (False, None)
+
+
 def oof_tahmin_universal(algo, params, X_tr, y_tr, n_folds, n_tekrar,
                           n_jobs_override=None, es_split=0.0):
     """
     10 algoritmanın hepsiyle uyumlu OOF tahmini.
     v2.8 FIX #10+#14: try/except + skip örnekler prior alır.
+
+    [v6.4] LOKY PARALEL — Fold seviyesinde process-level paralelleme.
+    Optuna resmi FAQ (https://optuna.readthedocs.io/en/stable/faq.html):
+      "It is recommended to use process-based parallelization if CPU bound"
+    joblib loky backend GIL bypass + memmap shared data.
+    Beklenen: 22 paralel × n_folds/22 batch → ~15-20x hızlanma KANSER'de.
     """
     rskf   = RepeatedStratifiedKFold(n_splits=n_folds, n_repeats=n_tekrar,
                                      random_state=RASTGELE_TOHUM)
     toplam = np.zeros(len(X_tr))
     sayac  = np.zeros(len(X_tr))
 
+    # Tüm fold argümanlarını hazırla
+    fold_argslari = []
+    val_idxler    = []
     for tr_idx, val_idx in rskf.split(X_tr, y_tr):
         X_ft = X_tr.iloc[tr_idx]
         y_ft = y_tr[tr_idx]
@@ -1832,14 +1882,29 @@ def oof_tahmin_universal(algo, params, X_tr, y_tr, n_folds, n_tekrar,
                 except Exception:
                     X_es = y_es = None
 
-        try:
-            m = model_fit_universal(algo, params, X_ft, y_ft, X_es, y_es,
-                                    n_jobs_override=n_jobs_override)
-            fold_proba = predict_proba_universal(m, algo, X_fv)
-            toplam[val_idx] += fold_proba
+        # Worker için tek thread (oversubscription önle)
+        worker_njobs = 1
+        fold_argslari.append((algo, params, X_ft, y_ft, X_fv,
+                              X_es, y_es, worker_njobs))
+        val_idxler.append(val_idx)
+
+    # joblib loky ile paralel — gerçek process paralelliği
+    try:
+        from joblib import Parallel, delayed
+        results = Parallel(n_jobs=PARALEL_ISCI, backend="loky",
+                           verbose=0, batch_size="auto")(
+            delayed(_oof_fold_worker)(args) for args in fold_argslari
+        )
+    except Exception as e:
+        # Fallback: sıralı çalıştır (loky problem çıkarırsa)
+        print(f"    [UYARI] Paralel fold başarısız ({type(e).__name__}), sıralıya geçiliyor")
+        results = [_oof_fold_worker(args) for args in fold_argslari]
+
+    # Sonuçları topla
+    for (basarili, prob), val_idx in zip(results, val_idxler):
+        if basarili and prob is not None:
+            toplam[val_idx] += prob
             sayac[val_idx]  += 1
-        except Exception:
-            pass
 
     prior = float(y_tr.mean())
     sonuc = toplam / np.maximum(sayac, 1)
