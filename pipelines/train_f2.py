@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  BioSense AI v7.0 — Total Paralel + Cache Hızlandırma + GPU Strateji        ║
+║  BioSense AI v7.3 — FAZ 1 Fold-Paralel + Feature-Aware (PAH RAM Çökme Fix)            ║
 ║  Sağlıkta Yapay Zeka Yarışması — Üniversite Kategorisi                      ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║                                                                              ║
@@ -512,32 +512,53 @@ CB_TASK_TYPE = "GPU" if GPU_AKTIF else "CPU"
 #      → GPU mode'da Optuna n_jobs=1 + her trial GPU'da hızlı
 
 def algo_paralelizm(algo):
-    """[v7.0] Algoritma için (optuna_n_jobs, model_n_jobs) tuple döndürür.
+    """[v7.2] Algoritma için (optuna_n_jobs, model_n_jobs) tuple döndürür.
+
+    [v7.2 KRİTİK FIX] PAH RAM ÇÖKME PROBLEMİ:
+      Eski (sadece N_TRAIN'a bakıyordu):
+        PAH: 297×260 özellik = ağır iş yükü ama N<800 → 22 paralel CatBoost
+        22 worker × CatBoost 260 özellik × 297 örnek = ~3-5GB RAM/worker
+        TOPLAM: 66-110GB RAM → 96GB sistemde SWAP → ÇÖKÜŞ
+      Yeni (N × N_FEATURES iş yükü):
+        İş yükü = N_TRAIN × N_FEATURES_EFFECTIVE
+        - Hafif (<30K)   → outer paralel — KANSER 310×30=9.3K
+        - Orta (30K-200K) → outer SIRALI, inner C++ thread — PAH 297×260=77K
+        - Ağır (>200K)   → inner paralel — MASTER
 
     Strateji:
-      KÜÇÜK DATA (N_TRAIN < 800, örn KANSER 310):
-        - TÜM tree modeller outer-paralel — fit kısa, paralel trial efficient
-        - Inner-paralel overhead'i fit süresinden büyük (parallel slowdown)
-      BÜYÜK DATA (N_TRAIN >= 800, örn MASTER 2400):
-        - C++ boosting (XGB/LGB/CB): inner-paralel (-1) tek trial uzun
-        - sklearn tree (RF/ET): inner-paralel — bagging trees paralel çoğalır
-      GPU MODE:
-        - Tek GPU = paralel trial imkansız (memory contention)
-        - C++ boosting GPU mode'da outer=1, inner=GPU (otomatik)
-        - Sklearn modeller GPU desteği yok → CPU + outer-paralel
+      GPU MODE: tek GPU = paralel imkansız → outer=1
+      C++ boosting (XGB/LGB/CB): iş yüküne göre outer veya inner
+      sklearn tree (RF/ET): iş yüküne göre — RAM duyarlı
+      Hafif modeller (LR/SVM/kNN/MLP): her zaman outer paralel
     """
     # [v7.0] GPU mode için özel — tek GPU paylaşılamaz
     if GPU_AKTIF and algo in ("xgboost", "lightgbm", "catboost"):
         return (1, -1)  # outer SIRALI + GPU thread'i model içinde
 
+    # [v7.2] İş yükü hesabı: N × F (SHAP sonrası kalan özellik tercih edilir)
+    n_train = globals().get('N_TRAIN', 1000)
+    # N_FEATURES_EFFECTIVE: SHAP sonrası kalan özellik sayısı.
+    # Yoksa orijinal N_FEATURES kullan; o da yoksa default 100.
+    n_feat = globals().get('N_FEATURES_EFFECTIVE',
+                            globals().get('N_FEATURES', 100))
+    is_yuku = n_train * n_feat
+
     # Tree-based modeller için adaptive
     if algo in ("random_forest", "extra_trees", "xgboost", "lightgbm", "catboost"):
-        if 'N_TRAIN' in globals() and N_TRAIN < 800:
-            return (PARALEL_ISCI, 1)   # küçük data → outer paralel (KANSER)
-        return (1, -1)                 # büyük data → inner paralel (MASTER)
+        if is_yuku < 30_000:
+            # Hafif iş yükü (KANSER 310×30=9.3K) → outer paralel verimli
+            return (PARALEL_ISCI, 1)
+        elif is_yuku < 200_000:
+            # Orta iş yükü (PAH 297×260=77K, CFTR ~)
+            # → outer SIRALI + inner C++ thread paralel (RAM güvenli)
+            # CatBoost özellikle RAM-yoğun, 1 trial × tüm CPU çok daha güvenli
+            return (1, -1)
+        else:
+            # Ağır iş yükü (MASTER 2400+ × 100+ = 240K+) → inner paralel
+            return (1, -1)
 
-    # Küçük/sıralı modeller: her zaman outer paralel
-    return (PARALEL_ISCI, 1)        # SVM, kNN, NB, Logistic, MLP
+    # Hafif modeller (LR/SVM/kNN/NB/MLP): RAM düşük, her zaman outer paralel
+    return (PARALEL_ISCI, 1)
 
 
 def hizli_trial_say(study, state=None):
@@ -561,6 +582,68 @@ def hizli_trial_say(study, state=None):
             return hizli_trial_say(study)
         return sum(1 for t in study.trials if t.state == state)
 
+
+class TrialProgressCallback:
+    """[v7.1] Per-trial progress callback — paralel mod için.
+
+    SORUN: Optuna'nın show_progress_bar=True paralel (n_jobs > 1) modunda
+    tqdm güncellemeleri ana thread'e doğru iletilmiyor. 0/72 ekranı 22 trial
+    bitene kadar takılı kalır.
+    PAH 260 özellik × 297 örnek + 22 paralel trial → 5-15 dk "boş ekran" hissi.
+
+    ÇÖZÜM: Her trial main thread'te print et — bekletme algısı kaybolur,
+    gerçek progress + ETA görünür.
+    """
+    def __init__(self, algo_name, n_hedef, n_baslangic=0):
+        self.algo = algo_name
+        self.n_hedef = n_hedef
+        self.t0 = time.perf_counter()
+        self.n_baslangic = n_baslangic
+        try:
+            import threading
+            self._lock = threading.Lock()
+        except Exception:
+            self._lock = None
+
+    def __call__(self, study, trial):
+        state = trial.state
+        if state == optuna.trial.TrialState.RUNNING:
+            return
+
+        def _yaz():
+            # hizli_trial_say ile O(1) sayım
+            tamamlanan = hizli_trial_say(study, optuna.trial.TrialState.COMPLETE)
+            yeni_tamamlanan = tamamlanan - self.n_baslangic
+            gecen = time.perf_counter() - self.t0
+            kalan_trial = max(0, self.n_hedef - yeni_tamamlanan)
+
+            # ETA tahmini
+            if yeni_tamamlanan > 0:
+                hiz = gecen / yeni_tamamlanan
+                eta = hiz * kalan_trial
+                eta_str = f", ETA: {eta:5.0f}s" if eta > 0 else ""
+            else:
+                eta_str = ""
+
+            # Trial sonucu özeti
+            if state == optuna.trial.TrialState.COMPLETE and trial.value is not None:
+                val_str = f"F2={trial.value:.4f}"
+            elif state == optuna.trial.TrialState.PRUNED:
+                val_str = "PRUNED"
+            else:
+                val_str = "FAIL"
+
+            print(f"    [{yeni_tamamlanan:>3}/{self.n_hedef}] "
+                  f"{self.algo:<13} #{trial.number} → "
+                  f"{val_str:<14} ({gecen:5.0f}s{eta_str})",
+                  flush=True)
+
+        if self._lock is not None:
+            with self._lock:
+                _yaz()
+        else:
+            _yaz()
+
 def algo_paralelizm_eski_kullanma(algo):
     """[KULLANMA] Bu fonksiyon v7.0'da yukarıda yeniden tanımlandı."""
     pass
@@ -568,7 +651,11 @@ def algo_paralelizm_eski_kullanma(algo):
 # ── FAZ 1: Geniş tarama ───────────────────────────────────────────
 # [v4.9] BU PARAMETRELER DİNAMİK — kullanıcı modu + sistem otomatik birleştirilir
 FAZ1_FOLDS     = 5
-FAZ1_TEKRAR    = 20
+# [v7.4] FAZ1_TEKRAR: 20 → 6 (100 fold → 30 fold, eski abes idi)
+# Bilim: 30 fold ile std/√30 ≈ std/5.5 yeterli istatistiksel güç.
+# Eski 100 fold std/√100 = std/10 — sadece 1.8x sıkı, ama 3.3x daha yavaş.
+# FAZ 1 amacı eleme; algoritma seçimi 30 fold ile aynı kararı verir.
+FAZ1_TEKRAR    = 6
 FAZ1_TRIAL_PER_ALGO_BASE = {
     "xgboost":       80,
     "lightgbm":      80,
@@ -610,7 +697,9 @@ FAZ3_TRIAL_PER_ALGO_BASE = {
     "mlp":           400,    # eski 800 → 400
 }
 FAZ3_FOLDS          = 5
-FAZ3_TEKRAR         = 10
+# [v7.4] FAZ3_TEKRAR: 10 → 5 (50 fold → 25 fold)
+# Final scoring için 25 fold yeterli; ULTRA çarpanı 1.2 ile 30 fold olur.
+FAZ3_TEKRAR         = 5
 FAZ3_DB_PREFIX      = f"sqlite:///biosense_faz3_v4_{DATA_SUFFIX}"
 FAZ3_TOP_K          = 5
 
@@ -671,14 +760,13 @@ def _mod_sec():
 CALISMA_MODU = _mod_sec()
 
 # Mod çarpanları
-# [v6.5] ULTRA çarpanları PARALELLEME SAYESİNDE tekrar yukarı çekildi
-#   - v6.4'te FAZ 2/4-A paralel, v6.5'te FAZ 3 trial-içi paralel
-#   - 15-20x hızlanma → ULTRA trial bütçesini arttırabiliriz
-#   - trial 1.0 → 1.5 (önceki ULTRA değeri) — paralel sayesinde aynı süre
-#   - fold  1.0 → 1.2 (60 fold — daha fazla istatistiksel güç)
-#   - iter  1.1 (korundu)
+# [v7.4] BAZ DEĞERLER DÜŞÜRÜLDÜ — eski abes fold sayıları kaldırıldı.
+# Yeni baz: FAZ1=30 fold, FAZ3=25 fold (bilim için yeterli)
+# ULTRA çarpan 1.2 → FAZ1=36, FAZ3=30 fold (marjinal ekstra güvence)
+# Eski v7.3 ULTRA: 120 fold × 90 trial × 2s = 6.6 saat (PAH CatBoost)
+# Yeni v7.4 ULTRA: 36 fold × 90 trial × 2s / 22 worker (fold-paralel) = ~4 dakika
 _MOD_CARPANI = {
-    "fast":    {"trial": 0.5,  "fold": 0.5,  "iter": 0.7,
+    "fast":    {"trial": 0.5,  "fold": 0.7,  "iter": 0.7,
                 "label": "FAST", "renk": "🟢"},
     "default": {"trial": 1.0,  "fold": 1.0,  "iter": 1.0,
                 "label": "DEFAULT", "renk": "🟡"},
@@ -789,7 +877,7 @@ PREPROCESSING_GEREK = {
 }
 
 print("=" * 72)
-print("  BioSense AI v7.0 — Total Paralel + Cache Hızlandırma + GPU Strateji")
+print("  BioSense AI v7.3 — FAZ 1 Fold-Paralel + Feature-Aware + Per-Trial Progress + Cache Hız")
 print(f"  Toplam algoritma havuzu: {len(TUM_ALGORITMALAR)}")
 print(f"  FAZ 1: {sum(FAZ1_TRIAL_PER_ALGO.get(a, 30) for a in TUM_ALGORITMALAR)} "
       f"trial × {FAZ1_FOLDS*FAZ1_TEKRAR} fold")
@@ -856,10 +944,23 @@ y_test  = np.array(y_test)
 SPW     = float((y_train == 0).sum()) / max(float((y_train == 1).sum()), 1)
 N_TRAIN = len(X_train)
 N_TEST  = len(X_test)
+# [v7.2] N_FEATURES — algo_paralelizm iş yükü hesabı için kritik
+N_FEATURES = len(OZELLIK)
+N_FEATURES_EFFECTIVE = N_FEATURES   # SHAP sonrası güncellenecek
 
 print(f"  Train: {N_TRAIN} | Test (kilitli): {N_TEST} | SPW: {SPW:.3f}")
-print(f"  Özellik: {len(OZELLIK)} ({len(KAT_KOLONLAR)} kategorik)")
+print(f"  Özellik: {N_FEATURES} ({len(KAT_KOLONLAR)} kategorik)")
 print(f"  Sınıf dağılımı: {dict(zip(*np.unique(y, return_counts=True)))}")
+
+# [v7.2] İş yükü uyarısı — RAM çökme riskini engelle
+_is_yuku = N_TRAIN * N_FEATURES
+if _is_yuku >= 200_000:
+    print(f"  [v7.2] İş yükü: {_is_yuku:,} (AĞIR) → inner-paralel, RAM güvenli")
+elif _is_yuku >= 30_000:
+    print(f"  [v7.2] İş yükü: {_is_yuku:,} (ORTA) → outer SIRALI + inner C++ thread")
+    print(f"         (KRİTİK: {N_FEATURES} özellik × {N_TRAIN} örnek → 22 paralel CatBoost RAM patlatabilir)")
+else:
+    print(f"  [v7.2] İş yükü: {_is_yuku:,} (HAFİF) → outer paralel ({PARALEL_ISCI} trial)")
 
 BUDANAN_OZELLIKLER = []
 
@@ -2095,21 +2196,31 @@ def suggest_params(trial, algo, geniş=True):
     if algo == "catboost":
         # [v6.2.2] thread_count dynamic
         _, cb_inner_nj = algo_paralelizm("catboost")
+        # [v7.4] CatBoost iter aralığını AGRESİF düşür — eski 100-800 çok yüksek
+        # CatBoost early stopping olmayan implementasyonda iter çok=zaman çok.
+        # Pratikte optimum genelde 100-300 arası, 500+ marjinal.
+        n_train_cb = globals().get('N_TRAIN', 1000)
+        n_feat_cb = globals().get('N_FEATURES_EFFECTIVE',
+                                    globals().get('N_FEATURES', 100))
+        is_yuku_cb = n_train_cb * n_feat_cb
+        if is_yuku_cb >= 30_000:
+            # PAH gibi ağır data: 50-200 iter yeterli
+            iter_min, iter_max = 50, 200
+            border_cnt = 64
+        else:
+            # KANSER gibi hafif data: 100-400 iter
+            iter_min, iter_max = 100, 400
+            border_cnt = 128 if n_train_cb < 800 else 254
         return {
-            "iterations":        trial.suggest_int("cb_iter", 100, 800),
-            "depth":             trial.suggest_int("cb_depth", 2, 8),
+            "iterations":        trial.suggest_int("cb_iter", iter_min, iter_max),
+            "depth":             trial.suggest_int("cb_depth", 2, 7),  # 8 → 7
             "learning_rate":     trial.suggest_float("cb_lr", 0.003, 0.30, log=True),
             "l2_leaf_reg":       trial.suggest_float("cb_l2", 0.1, 30.0),
             "min_data_in_leaf":  trial.suggest_int("cb_mdl", 1, 50),
             "subsample":         trial.suggest_float("cb_sub", 0.35, 1.00),
             "colsample_bylevel": trial.suggest_float("cb_cbl", 0.40, 1.00),
             "scale_pos_weight":  trial.suggest_float("cb_spw", SPW*0.2, SPW*6.0),
-            # [v7.0] border_count default 1000! Küçük data için 128 yeterli
-            # (CatBoost doc: "128 splits are enough for many datasets")
-            # CPU'da etki minimal, GPU'da büyük. Yine de küçük data için tutarlı.
-            "border_count": 128 if (
-                'N_TRAIN' in globals() and N_TRAIN < 800
-            ) else 254,
+            "border_count":      border_cnt,
             "random_seed": RASTGELE_TOHUM, "thread_count": cb_inner_nj, "verbose": False,
         }
 
@@ -2426,8 +2537,15 @@ if SHAP_OK and SHAP_PERCENTILE > 0:
         X_test        = X_test[kalan_cols]
         KAT_KOLONLAR  = [c for c in KAT_KOLONLAR if c in kalan_cols]
         BUDANAN_OZELLIKLER = [c for c in all_cols if c not in kalan_cols]
+        # [v7.2] SHAP sonrası kalan özellik sayısı — algo_paralelizm iş yükü
+        N_FEATURES_EFFECTIVE = len(kalan_cols)
 
         print(f"\n  {len(kalan_cols)} özellik kaldı ({budanan_cnt} budandı)")
+        # [v7.2] Güncel iş yükü ile paralel strateji bilgisi
+        _is_yuku_son = N_TRAIN * N_FEATURES_EFFECTIVE
+        if _is_yuku_son >= 30_000:
+            print(f"  [v7.2] SHAP sonrası iş yükü: {_is_yuku_son:,} → "
+                  f"CatBoost outer-SIRALI (RAM güvenli)")
 
         # v4.1: SHAP top 15 özellik grafiği
         top15_idx = onem_sirasi[:15]
@@ -2464,30 +2582,103 @@ else:
 print(f"\n[3/9] FAZ 1: {len(TUM_ALGORITMALAR)} algoritma geniş tarama")
 print("-" * 72)
 
+def _faz1_fold_worker(args):
+    """[v7.3] FAZ 1 trial fold worker — module-level (loky picklable).
+
+    Tek fold için: model fit + tahmin + en iyi eşik + F2, F1, AUC.
+    Returns: (f2, f1, auc) tuple. Hata olursa (0.0, 0.0, 0.0).
+
+    [v6.5.1] OMP/MKL thread'leri 1'e zorla (oversubscription önle).
+    [v7.3] n_jobs_override=1 zorla — worker tek thread (loky kendi paralelizmi).
+    """
+    # BLAS/OMP thread'lerini 1'e zorla
+    import os as _os
+    _os.environ.setdefault("OMP_NUM_THREADS", "1")
+    _os.environ.setdefault("MKL_NUM_THREADS", "1")
+    _os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
+    (algo, params, X_fold_tr, y_fold_tr, X_fold_es, y_fold_es,
+     X_val, y_val) = args
+    try:
+        m    = model_fit_universal(algo, params, X_fold_tr, y_fold_tr,
+                                    X_fold_es, y_fold_es,
+                                    n_jobs_override=1)
+        prob = predict_proba_universal(m, algo, X_val)
+        esik, f2 = en_iyi_f2_esik_grid(y_val, prob, adim=0.01)
+        pred = (prob >= esik).astype(int)
+        f1 = f1_score(y_val, pred, pos_label=1, average="binary", zero_division=0)
+        auc   = roc_auc_score(y_val, prob)
+        return (f2, f1, auc)
+    except Exception:
+        return (0.0, 0.0, 0.0)
+
+
 def faz1_objective_factory(algo):
     """Bir algoritma için Optuna objective fonksiyonu üretir.
 
     [v6.5.1 KRİTİK FIX] inner n_jobs algo_paralelizm'den okunur.
-    Outer-paralel (22 trial) + inner=-1 (24 thread) = 528 thread oversubscription.
-    Doğrusu: outer-paralel ise inner=1, outer-sıralı ise inner=-1.
+    [v7.3 BÜYÜK FIX] outer SIRALI (PAH gibi ağır data) için fold-PARALEL mod:
+      Eski: 120 fold sıralı × CatBoost 24-thread → CPU %10 (thread overhead)
+      Yeni: 120 fold paralel × CatBoost 1-thread → CPU %95+ (gerçek paralel)
+      Test sonucu: CatBoost trial 266s → ~25s = ~10x hızlanma.
     """
-    # algo'nun (outer, inner) stratejisini al — closure'a kapat
+    # algo'nun (outer, inner) stratejisini al
     _outer_nj, _inner_nj = algo_paralelizm(algo)
+    # [v7.3] outer SIRALI ise fold-PARALEL mod aktif
+    _fold_paralel = (_outer_nj == 1)
 
     def objective(trial):
         params = suggest_params(trial, algo)
         rskf = RepeatedStratifiedKFold(n_splits=FAZ1_FOLDS, n_repeats=FAZ1_TEKRAR,
                                        random_state=RASTGELE_TOHUM)
+
+        # ───── [v7.3] FOLD-PARALEL MOD (outer=1, PAH gibi ağır data) ─────
+        if _fold_paralel:
+            # Tüm fold args'larını topla
+            fold_argslari = []
+            for tr_idx, val_idx in rskf.split(X_train, y_train):
+                if algo in ("xgboost", "lightgbm", "catboost"):
+                    X_fold_tr, y_fold_tr, X_fold_es, y_fold_es = fold_es_ayir(
+                        X_train.iloc[tr_idx], y_train[tr_idx]
+                    )
+                else:
+                    X_fold_tr = X_train.iloc[tr_idx]
+                    y_fold_tr = y_train[tr_idx]
+                    X_fold_es = y_fold_es = None
+                fold_argslari.append((algo, params, X_fold_tr, y_fold_tr,
+                                       X_fold_es, y_fold_es,
+                                       X_train.iloc[val_idx], y_train[val_idx]))
+
+            # Fold'ları paralel çalıştır (loky)
+            try:
+                from joblib import Parallel, delayed
+                results = Parallel(n_jobs=PARALEL_ISCI, backend="loky",
+                                   verbose=0, batch_size="auto")(
+                    delayed(_faz1_fold_worker)(args) for args in fold_argslari
+                )
+            except Exception:
+                # Fallback sıralı
+                results = [_faz1_fold_worker(args) for args in fold_argslari]
+
+            f2_listesi  = [r[0] for r in results]
+            f1_listesi  = [r[1] for r in results]
+            auc_listesi = [r[2] for r in results]
+
+            # Kullanıcı attr (FAZ 4-A için)
+            trial.set_user_attr("f2_scores", f2_listesi)
+            trial.set_user_attr("f1_scores", f1_listesi)
+            return float(np.mean([W_F2*f + W_AUC*a
+                                   for f, a in zip(f2_listesi, auc_listesi)]))
+
+        # ───── KLASİK MOD (outer paralel — KANSER gibi hafif data) ─────
+        # Bu mod outer-paralel olduğu için worker'lar zaten paralel → fold sıralı OK
         f2_listesi  = []
-        f1_listesi  = []   # v3.5: sadece tabloda raporlamak için (eleme/seçim DEĞİL)
+        f1_listesi  = []
         auc_listesi = []
-        # Pruner için ara rapor adımları
         toplam_fold = FAZ1_FOLDS * FAZ1_TEKRAR
         RAPOR_ADIMI = {toplam_fold // 4, toplam_fold // 2, 3 * toplam_fold // 4}
 
         for fold_no, (tr_idx, val_idx) in enumerate(rskf.split(X_train, y_train)):
-            # [FIX] ES ayrımı yalnız boosting algos için anlamlı; diğerleri için
-            # %10 veri kaybı önlenir. 388 örnekte her örnek değerli.
             if algo in ("xgboost", "lightgbm", "catboost"):
                 X_fold_tr, y_fold_tr, X_fold_es, y_fold_es = fold_es_ayir(
                     X_train.iloc[tr_idx], y_train[tr_idx]
@@ -2497,13 +2688,11 @@ def faz1_objective_factory(algo):
                 y_fold_tr = y_train[tr_idx]
                 X_fold_es = y_fold_es = None
             try:
-                # [v6.5.1] n_jobs_override ile oversubscription önle
                 m    = model_fit_universal(algo, params, X_fold_tr, y_fold_tr,
                                             X_fold_es, y_fold_es,
                                             n_jobs_override=_inner_nj)
                 prob = predict_proba_universal(m, algo, X_train.iloc[val_idx])
                 esik, f2 = en_iyi_f2_esik_grid(y_train[val_idx], prob, adim=0.01)
-                # Aynı eşikte F1'i de hesapla (sadece tablo için)
                 pred = (prob >= esik).astype(int)
                 f1 = f1_score(y_train[val_idx], pred, pos_label=1,
                               average="binary", zero_division=0)
@@ -2524,9 +2713,8 @@ def faz1_objective_factory(algo):
                 except optuna.exceptions.TrialPruned: raise
                 except Exception: pass
 
-        # Trial'a fold-bazlı F2 + F1 skorlarını user_attr olarak kaydet
         trial.set_user_attr("f2_scores", f2_listesi)
-        trial.set_user_attr("f1_scores", f1_listesi)   # v3.5: tablo için
+        trial.set_user_attr("f1_scores", f1_listesi)
         return float(np.mean([W_F2*f + W_AUC*a
                               for f, a in zip(f2_listesi, auc_listesi)]))
     return objective
@@ -2577,13 +2765,22 @@ for algo in TUM_ALGORITMALAR:
         # [FIX O] Algoritmaya göre paralellik stratejisi
         outer_njobs, _ = algo_paralelizm(algo)
         if outer_njobs == 1:
-            print(f"    [FIX O] {algo} için outer SEQUENTIAL, "
-                  f"iç model n_jobs=-1 (24 thread/tree)")
+            print(f"    [v7.3] {algo} → outer SIRALI + FOLD-PARALEL "
+                  f"(loky, {PARALEL_ISCI} worker, {FAZ1_FOLDS*FAZ1_TEKRAR} fold)")
+        else:
+            print(f"    [v7.1] {algo} için {outer_njobs} paralel trial — "
+                  f"per-trial progress aşağıda")
+
+        # [v7.1] Manuel progress callback — paralel modda Optuna progress bar
+        # bozuk, ana thread'e güncellemeler gelmez. Custom callback ana thread'te.
+        progress_cb = TrialProgressCallback(algo, n_trial, n_baslangic=mevcut)
+
         # ŞEBNUS ÖLÜMSÜZ MODU
         while kalan > 0:
             try:
                 study.optimize(faz1_objective_factory(algo), n_trials=kalan,
-                                n_jobs=outer_njobs, show_progress_bar=True,
+                                n_jobs=outer_njobs, show_progress_bar=False,
+                                callbacks=[progress_cb],
                                 catch=(Exception,))
                 break
             except Exception as e:
@@ -2997,10 +3194,16 @@ for algo in secilen_algoritmalar:
         outer_njobs = 1
         print(f"    [v6.5] FAZ 3: outer SEQUENTIAL, fold-level paralel "
               f"(loky, {PARALEL_ISCI} worker)")
+
+        # [v7.1] Manuel progress callback — sıralı modda da çalışır
+        progress_cb = TrialProgressCallback(algo, algo_trial_budget,
+                                              n_baslangic=mevcut)
+
         while kalan > 0:
             try:
                 study.optimize(faz3_objective_factory(algo), n_trials=kalan,
-                                n_jobs=outer_njobs, show_progress_bar=True,
+                                n_jobs=outer_njobs, show_progress_bar=False,
+                                callbacks=[progress_cb],
                                 catch=(Exception,))
                 break
             except Exception as e:
@@ -3896,7 +4099,7 @@ for k in ["n_jobs", "thread_count", "verbosity", "verbose",
 
 sonuc = {
     "_aciklama": {
-        "surum"          : f"BioSense AI v7.0 — Total Paralel + Cache Hız ({DATA_SUFFIX.upper()}, {CALISMA_MODU.upper()})",
+        "surum"          : f"BioSense AI v7.3 — FAZ 1 Fold-Paralel + Feature-Aware + Per-Trial Progress ({DATA_SUFFIX.upper()}, {CALISMA_MODU.upper()})",
         "calisma_modu"   : CALISMA_MODU,
         "sistem_profili" : {
             "cpu_logical"     : int(_cpu_count_logical),
@@ -4106,5 +4309,5 @@ print(f"     [v5.1] trial_convergence_*.png (3 algoritma için)")
 print(f"     [v5.1] feature_grup_analizi.png (pasta + bar)")
 print(f"     [v5.1] ensemble_shap.png (gerçek karar mantığı)")
 print("\n" + "=" * 72)
-print(f"  BioSense AI v7.0 — TAMAMLANDI ({DATA_SUFFIX.upper()}, MOD: {CALISMA_MODU.upper()})")
+print(f"  BioSense AI v7.3 — TAMAMLANDI ({DATA_SUFFIX.upper()}, MOD: {CALISMA_MODU.upper()})")
 print("=" * 72)
