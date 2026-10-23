@@ -1,0 +1,35 @@
+# Deny all files by default; review every new public path.
+*
+!*/
+!/.gitattributes
+!/.githooks/pre-commit
+!/.githooks/pre-push
+!/.github/workflows/ci.yml
+!/.gitignore
+!/.streamlit/config.toml
+!/CONTRIBUTING.md
+!/NOTICE.md
+!/README.md
+!/apps/evaluate.py
+!/docs/DATA_POLICY.md
+!/docs/DEVELOPMENT_HISTORY.md
+!/docs/USAGE.md
+!/docs/VALIDATION.md
+!/docs/source-history.json
+!/pipelines/train_f1.py
+!/pipelines/train_f2.py
+!/requirements.txt
+!/scripts/check_public_repo.py
+!/scripts/make_demo_data.py
+!/scripts/smoke_demo.py
+!/tests/test_repository.py
+!/train.py
+
+# Private inputs and generated artifacts stay local.
+/data/
+/datasets/
+/runs/
+/models/
+/.venv/
+/venv/
+**/__pycache__/
