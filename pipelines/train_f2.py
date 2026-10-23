@@ -107,6 +107,46 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 import optuna
+
+# ════════════════════════════════════════════════════════════════════
+# [v6.2.3] KRİTİK FIX: SQLite WAL mode — DB Lock Contention Çözümü
+# ════════════════════════════════════════════════════════════════════
+# Sorun: Outer-parallel 22 trial paralel SQLite'a yazıyor → 21 trial
+# lock bekliyor → CPU %8'de takılıyor (özellikle FAZ 3'te trial kısa
+# olduğunda DB'ye çok sık yazılıyor).
+#
+# Çözüm: WAL (Write-Ahead Logging) modu — concurrent okuma + yazma.
+# Tüm SQLAlchemy engine'lara global olarak uygulanır.
+# Optuna RDBStorage SQLAlchemy kullandığı için bu Optuna'ya da geçer.
+try:
+    from sqlalchemy import event
+    from sqlalchemy.engine import Engine
+
+    @event.listens_for(Engine, "connect")
+    def _enable_sqlite_wal(dbapi_connection, connection_record):
+        """SQLite bağlantısı kurulurken WAL mode + performans pragma'ları uygula."""
+        try:
+            # SQLite olmayan bağlantılarda (postgres vs) bu cursor hata atar, atla
+            module_name = dbapi_connection.__class__.__module__.lower()
+            if "sqlite" not in module_name:
+                return
+            cursor = dbapi_connection.cursor()
+            # WAL mode: concurrent readers + 1 writer, lock contention çözer
+            cursor.execute("PRAGMA journal_mode=WAL")
+            # synchronous=NORMAL: WAL ile güvenli, %3-5 hızlanma
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            # 64MB page cache (default 2MB) — outer-parallel için kritik
+            cursor.execute("PRAGMA cache_size=-65536")
+            # temp_store=MEMORY: geçici tablolar diskte değil RAM'de
+            cursor.execute("PRAGMA temp_store=MEMORY")
+            # 60s busy timeout (default 0) — paralel yazıcılar bekler crashlemez
+            cursor.execute("PRAGMA busy_timeout=60000")
+            cursor.close()
+        except Exception:
+            pass  # SQLite olmayan veya pragma desteklemeyen sürücüler için sessiz
+    print("  [v6.2.3] SQLite WAL mode + performans pragma'ları aktif (DB lock fix)")
+except ImportError:
+    print("  [v6.2.3] SQLAlchemy event sistemi yok, WAL mode atlandı")
 from sklearn.model_selection import train_test_split, RepeatedStratifiedKFold
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
@@ -432,29 +472,32 @@ CB_TASK_TYPE = "GPU" if GPU_AKTIF else "CPU"
 # - Diğer sklearn (LR/SVM/kNN/NB/MLP): Optuna 24, model n_jobs=1
 #   → Modeller hızlı, dış paralelizm daha verimli
 def algo_paralelizm(algo):
-    """[v6.2] Algoritma için (optuna_n_jobs, model_n_jobs) tuple döndürür.
+    """[v6.2.2] Algoritma için (optuna_n_jobs, model_n_jobs) tuple döndürür.
 
-    Strateji:
-    - C++ paralel boosting (XGB/LGB/CB): inner-parallel
-        Tüm CPU bir trial'a kanalize → SQLite DB lock contention yok
-    - sklearn tree bagging (RF/ET): VERİ SETİ BOYUTUNA GÖRE
-        Küçük data (KANSER 388): fit hızlı → outer-parallel daha verimli
-        Büyük data (MASTER 3K+): fit yavaş → inner-parallel daha verimli
-        Sebep: küçük datada joblib spawn overhead inner'ı yutuyor → CPU %10
-    - Küçük modeller (SVM/kNN/Logistic/NB/MLP): outer-parallel
-        Tek model fit'i kısa → paralel trial mantıklı
+    Strateji: VERİ SETİ BOYUTUNA GÖRE adaptive — tüm tree modeller için.
+
+    Küçük data (N_TRAIN < 800, örn. KANSER 310):
+      - Tek trial fit'i kısa (saniyenin altı)
+      - Inner-parallel spawn overhead'i fit süresinden büyük → CPU %10
+      - Outer-parallel (22 trial) çok daha verimli → CPU %95+
+      - Risk: SQLite DB lock contention (ama trial kısa olduğu için kabul edilebilir)
+
+    Büyük data (N_TRAIN >= 800, örn. MASTER 2400):
+      - Tek trial fit'i uzun (10+ saniye)
+      - Inner-parallel C++ paralellemesi mükemmel
+      - DB contention çok daha az (trial uzun, lock kısa)
+
+    Sklearn olmayan modeller (SVM/kNN/Logistic/NB/MLP):
+      - Her zaman outer-parallel (tek model fit'i kısa, paralel trial mantıklı)
+      - MLP sklearn n_jobs desteklemediği için zaten içeride tek thread
     """
-    if algo in ("random_forest", "extra_trees"):
-        # [v6.2.1 FIX] Küçük datada inner-parallel CPU %10'da kalıyordu
-        # Veri seti boyutuna göre adaptive seçim:
+    # Tree-based modeller için adaptive
+    if algo in ("random_forest", "extra_trees", "xgboost", "lightgbm", "catboost"):
         if 'N_TRAIN' in globals() and N_TRAIN < 800:
             return (PARALEL_ISCI, 1)   # küçük data → outer paralel
         return (1, -1)                 # büyük data → inner paralel
-    if algo in ("xgboost", "lightgbm"):
-        return (1, -1)              # C++ paralel — inner çok daha verimli
-    if algo == "catboost":
-        return (1, -1)              # thread_count ile inner paralel
-    # Küçük/sıralı modeller: outer paralel mantıklı
+
+    # Küçük/sıralı modeller: her zaman outer paralel
     return (PARALEL_ISCI, 1)        # SVM, kNN, NB, Logistic, MLP
 
 # ── FAZ 1: Geniş tarama ───────────────────────────────────────────
@@ -1778,6 +1821,8 @@ def suggest_params(trial, algo, geniş=True):
     `geniş=True` → FAZ 1/FAZ 3 için tam aralık
     """
     if algo == "xgboost":
+        # [v6.2.2] n_jobs dynamic — algo_paralelizm()'den oku (küçük data → 1)
+        _, xgb_inner_nj = algo_paralelizm("xgboost")
         return {
             "n_estimators":      trial.suggest_int("xgb_n_est", 100, 1000),
             "max_depth":         trial.suggest_int("xgb_depth", 2, 8),
@@ -1793,10 +1838,12 @@ def suggest_params(trial, algo, geniş=True):
             "reg_lambda":        trial.suggest_float("xgb_lambda", 0.1, 30.0),
             "scale_pos_weight":  trial.suggest_float("xgb_spw", SPW*0.2, SPW*6.0),
             "enable_categorical": True, "tree_method": "hist", "device": XGB_DEVICE,
-            "verbosity": 0, "random_state": RASTGELE_TOHUM, "n_jobs": -1,
+            "verbosity": 0, "random_state": RASTGELE_TOHUM, "n_jobs": xgb_inner_nj,
         }
 
     if algo == "lightgbm":
+        # [v6.2.2] n_jobs dynamic
+        _, lgb_inner_nj = algo_paralelizm("lightgbm")
         return {
             "n_estimators":      trial.suggest_int("lgb_n_est", 100, 1000),
             "num_leaves":        trial.suggest_int("lgb_leaves", 20, 300),
@@ -1809,11 +1856,13 @@ def suggest_params(trial, algo, geniş=True):
             "reg_lambda":        trial.suggest_float("lgb_lambda", 0.1, 30.0),
             "min_split_gain":    trial.suggest_float("lgb_msg", 0.0, 5.0),
             "scale_pos_weight":  trial.suggest_float("lgb_spw", SPW*0.2, SPW*6.0),
-            "verbosity": -1, "random_state": RASTGELE_TOHUM, "n_jobs": -1,
+            "verbosity": -1, "random_state": RASTGELE_TOHUM, "n_jobs": lgb_inner_nj,
             "subsample_freq": 1,
         }
 
     if algo == "catboost":
+        # [v6.2.2] thread_count dynamic
+        _, cb_inner_nj = algo_paralelizm("catboost")
         return {
             "iterations":        trial.suggest_int("cb_iter", 100, 800),
             "depth":             trial.suggest_int("cb_depth", 2, 8),
@@ -1823,7 +1872,7 @@ def suggest_params(trial, algo, geniş=True):
             "subsample":         trial.suggest_float("cb_sub", 0.35, 1.00),
             "colsample_bylevel": trial.suggest_float("cb_cbl", 0.40, 1.00),
             "scale_pos_weight":  trial.suggest_float("cb_spw", SPW*0.2, SPW*6.0),
-            "random_seed": RASTGELE_TOHUM, "thread_count": -1, "verbose": False,
+            "random_seed": RASTGELE_TOHUM, "thread_count": cb_inner_nj, "verbose": False,
         }
 
     if algo == "random_forest":
