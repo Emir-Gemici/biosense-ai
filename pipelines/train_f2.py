@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  BioSense AI v6.4 — Loky Process-Parallel (Optuna Resmi Tavsiye)            ║
+║  BioSense AI v6.5 — FAZ 3 Trial-içi Paralel (Loky) + ULTRA Restore         ║
 ║  Sağlıkta Yapay Zeka Yarışması — Üniversite Kategorisi                      ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║                                                                              ║
@@ -643,16 +643,18 @@ def _mod_sec():
 CALISMA_MODU = _mod_sec()
 
 # Mod çarpanları
-# [v6.3] ULTRA fold çarpanı 1.2 → 1.0 (60 fold yerine 50)
-#   - 50 fold (5x10 RepeatedSKF) istatistiksel olarak yeterli
-#   - %16 hızlanma, F2 etkisi <%0.1
-#   - trial çarpan da 1.5 → 1.0 (FAZ3 trial bütçesi zaten yeniden kalibre edildi)
+# [v6.5] ULTRA çarpanları PARALELLEME SAYESİNDE tekrar yukarı çekildi
+#   - v6.4'te FAZ 2/4-A paralel, v6.5'te FAZ 3 trial-içi paralel
+#   - 15-20x hızlanma → ULTRA trial bütçesini arttırabiliriz
+#   - trial 1.0 → 1.5 (önceki ULTRA değeri) — paralel sayesinde aynı süre
+#   - fold  1.0 → 1.2 (60 fold — daha fazla istatistiksel güç)
+#   - iter  1.1 (korundu)
 _MOD_CARPANI = {
     "fast":    {"trial": 0.5,  "fold": 0.5,  "iter": 0.7,
                 "label": "FAST", "renk": "🟢"},
     "default": {"trial": 1.0,  "fold": 1.0,  "iter": 1.0,
                 "label": "DEFAULT", "renk": "🟡"},
-    "ultra":   {"trial": 1.0,  "fold": 1.0,  "iter": 1.1,
+    "ultra":   {"trial": 1.5,  "fold": 1.2,  "iter": 1.1,
                 "label": "ULTRA", "renk": "🔴"},
 }
 
@@ -759,7 +761,7 @@ PREPROCESSING_GEREK = {
 }
 
 print("=" * 72)
-print("  BioSense AI v6.3 — Optimizasyon Kalibresi + NB Çıkar + Cache Log")
+print("  BioSense AI v6.5 — FAZ 3 Trial-içi Paralel + ULTRA Restore")
 print(f"  Toplam algoritma havuzu: {len(TUM_ALGORITMALAR)}")
 print(f"  FAZ 1: {sum(FAZ1_TRIAL_PER_ALGO.get(a, 30) for a in TUM_ALGORITMALAR)} "
       f"trial × {FAZ1_FOLDS*FAZ1_TEKRAR} fold")
@@ -1827,7 +1829,15 @@ def _oof_fold_worker(args):
     Returns: (val_idx, prob) tuple
 
     Worker process içinde global'lar yok — her şey args ile gönderilir.
+
+    [v6.5.1] BLAS/OMP thread guard eklendi (loky zaten yapar, çift güvenlik).
     """
+    # Savunma: BLAS/OMP thread'lerini 1'e zorla
+    import os as _os
+    _os.environ.setdefault("OMP_NUM_THREADS", "1")
+    _os.environ.setdefault("MKL_NUM_THREADS", "1")
+    _os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
     (algo, params, X_ft, y_ft, X_fv, X_es, y_es,
      n_jobs_override) = args
     try:
@@ -2278,7 +2288,15 @@ print(f"\n[3/9] FAZ 1: {len(TUM_ALGORITMALAR)} algoritma geniş tarama")
 print("-" * 72)
 
 def faz1_objective_factory(algo):
-    """Bir algoritma için Optuna objective fonksiyonu üretir."""
+    """Bir algoritma için Optuna objective fonksiyonu üretir.
+
+    [v6.5.1 KRİTİK FIX] inner n_jobs algo_paralelizm'den okunur.
+    Outer-paralel (22 trial) + inner=-1 (24 thread) = 528 thread oversubscription.
+    Doğrusu: outer-paralel ise inner=1, outer-sıralı ise inner=-1.
+    """
+    # algo'nun (outer, inner) stratejisini al — closure'a kapat
+    _outer_nj, _inner_nj = algo_paralelizm(algo)
+
     def objective(trial):
         params = suggest_params(trial, algo)
         rskf = RepeatedStratifiedKFold(n_splits=FAZ1_FOLDS, n_repeats=FAZ1_TEKRAR,
@@ -2302,8 +2320,10 @@ def faz1_objective_factory(algo):
                 y_fold_tr = y_train[tr_idx]
                 X_fold_es = y_fold_es = None
             try:
+                # [v6.5.1] n_jobs_override ile oversubscription önle
                 m    = model_fit_universal(algo, params, X_fold_tr, y_fold_tr,
-                                            X_fold_es, y_fold_es)
+                                            X_fold_es, y_fold_es,
+                                            n_jobs_override=_inner_nj)
                 prob = predict_proba_universal(m, algo, X_train.iloc[val_idx])
                 esik, f2 = en_iyi_f2_esik_grid(y_train[val_idx], prob, adim=0.01)
                 # Aynı eşikte F1'i de hesapla (sadece tablo için)
@@ -2669,19 +2689,52 @@ if yol:
 print(f"\n[5/9] FAZ 3: {len(secilen_algoritmalar)} algoritmanın derin tuning'i")
 print("-" * 72)
 
+def _faz3_fold_worker(args):
+    """[v6.5] FAZ 3 trial fold worker — module-level (loky picklable).
+
+    Tek fold için: ES split → fit → predict → F2 + AUC hesabı
+    Returns: (f2, auc) tuple ya da exception → (0.0, 0.0)
+
+    [v6.5.1 KRİTİK FIX] n_jobs_override=1 — worker'da iç paralelleme YOK.
+    Aksi halde 22 worker × 24 thread = 528 thread oversubscription olur.
+    Loky zaten OMP/MKL thread'leri 1'e set eder, biz de model n_jobs=1
+    zorlayarak çift güvenlik sağlıyoruz.
+    """
+    # Savunma katmanı: BLAS/OMP thread'lerini 1'e zorla (loky de yapar ama emin ol)
+    import os as _os
+    _os.environ.setdefault("OMP_NUM_THREADS", "1")
+    _os.environ.setdefault("MKL_NUM_THREADS", "1")
+    _os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
+    (algo, params, X_fold_tr, y_fold_tr, X_fold_es, y_fold_es,
+     X_val, y_val) = args
+    try:
+        m    = model_fit_universal(algo, params, X_fold_tr, y_fold_tr,
+                                    X_fold_es, y_fold_es,
+                                    n_jobs_override=1)
+        prob = predict_proba_universal(m, algo, X_val)
+        _, f2 = en_iyi_f2_esik_grid(y_val, prob, adim=0.005)
+        auc   = roc_auc_score(y_val, prob)
+        return (f2, auc)
+    except Exception:
+        return (0.0, 0.0)
+
+
 def faz3_objective_factory(algo):
-    """FAZ 3 için tek-algoritma Optuna objective."""
+    """FAZ 3 için tek-algoritma Optuna objective.
+
+    [v6.5] PARALEL FOLD — Tüm fold'lar joblib loky ile aynı anda çalışır.
+    Pruner devre dışı (paralel mantığa zıt — fold'lar bitmeden raporlanamaz).
+    Beklenen etki: trial süresi 12s → 0.5-1s (~15-20x), CPU %95+.
+    """
     def objective(trial):
         params = suggest_params(trial, algo)
         rskf = RepeatedStratifiedKFold(n_splits=FAZ3_FOLDS, n_repeats=FAZ3_TEKRAR,
                                        random_state=RASTGELE_TOHUM)
-        f2_listesi  = []
-        auc_listesi = []
-        toplam_fold = FAZ3_FOLDS * FAZ3_TEKRAR
-        RAPOR_ADIMI = {toplam_fold // 4, toplam_fold // 2}
 
-        for fold_no, (tr_idx, val_idx) in enumerate(rskf.split(X_train, y_train)):
-            # [FIX] ES ayrımı yalnız boosting algos için
+        # Tüm fold args'larını topla
+        fold_argslari = []
+        for tr_idx, val_idx in rskf.split(X_train, y_train):
             if algo in ("xgboost", "lightgbm", "catboost"):
                 X_fold_tr, y_fold_tr, X_fold_es, y_fold_es = fold_es_ayir(
                     X_train.iloc[tr_idx], y_train[tr_idx]
@@ -2690,26 +2743,23 @@ def faz3_objective_factory(algo):
                 X_fold_tr = X_train.iloc[tr_idx]
                 y_fold_tr = y_train[tr_idx]
                 X_fold_es = y_fold_es = None
-            try:
-                m    = model_fit_universal(algo, params, X_fold_tr, y_fold_tr,
-                                            X_fold_es, y_fold_es)
-                prob = predict_proba_universal(m, algo, X_train.iloc[val_idx])
-                _, f2 = en_iyi_f2_esik_grid(y_train[val_idx], prob, adim=0.005)
-                auc   = roc_auc_score(y_train[val_idx], prob)
-            except Exception:
-                return 0.0
+            fold_argslari.append((algo, params, X_fold_tr, y_fold_tr,
+                                   X_fold_es, y_fold_es,
+                                   X_train.iloc[val_idx], y_train[val_idx]))
 
-            f2_listesi.append(f2)
-            auc_listesi.append(auc)
+        # Fold'ları paralel çalıştır
+        try:
+            from joblib import Parallel, delayed
+            results = Parallel(n_jobs=PARALEL_ISCI, backend="loky",
+                               verbose=0, batch_size="auto")(
+                delayed(_faz3_fold_worker)(args) for args in fold_argslari
+            )
+        except Exception:
+            # Fallback sıralı
+            results = [_faz3_fold_worker(args) for args in fold_argslari]
 
-            if fold_no in RAPOR_ADIMI:
-                birlesik = float(np.mean([W_F2*f + W_AUC*a
-                                          for f, a in zip(f2_listesi, auc_listesi)]))
-                try:
-                    trial.report(birlesik, step=fold_no)
-                    if trial.should_prune(): raise optuna.exceptions.TrialPruned()
-                except optuna.exceptions.TrialPruned: raise
-                except Exception: pass
+        f2_listesi  = [r[0] for r in results]
+        auc_listesi = [r[1] for r in results]
 
         return float(np.mean([W_F2*f + W_AUC*a
                               for f, a in zip(f2_listesi, auc_listesi)]))
@@ -2770,11 +2820,12 @@ for algo in secilen_algoritmalar:
 
     if kalan > 0:
         t0 = time.perf_counter()
-        # [FIX O] Algoritmaya göre paralellik stratejisi
-        outer_njobs, _ = algo_paralelizm(algo)
-        if outer_njobs == 1:
-            print(f"    [FIX O] {algo} için outer SEQUENTIAL, "
-                  f"iç model n_jobs=-1 (24 thread/tree)")
+        # [v6.5] FAZ 3'te outer SEQUENTIAL, fold-level paralel (loky)
+        #   - Trial içinde 22 worker fold paralel
+        #   - Outer Optuna paralel = oversubscription riski → 1
+        outer_njobs = 1
+        print(f"    [v6.5] FAZ 3: outer SEQUENTIAL, fold-level paralel "
+              f"(loky, {PARALEL_ISCI} worker)")
         while kalan > 0:
             try:
                 study.optimize(faz3_objective_factory(algo), n_trials=kalan,
@@ -3676,7 +3727,7 @@ for k in ["n_jobs", "thread_count", "verbosity", "verbose",
 
 sonuc = {
     "_aciklama": {
-        "surum"          : f"BioSense AI v6.3 — Optimizasyon Kalibresi ({DATA_SUFFIX.upper()}, {CALISMA_MODU.upper()})",
+        "surum"          : f"BioSense AI v6.5 — FAZ 3 Trial-içi Paralel ({DATA_SUFFIX.upper()}, {CALISMA_MODU.upper()})",
         "calisma_modu"   : CALISMA_MODU,
         "sistem_profili" : {
             "cpu_logical"     : int(_cpu_count_logical),
@@ -3886,5 +3937,5 @@ print(f"     [v5.1] trial_convergence_*.png (3 algoritma için)")
 print(f"     [v5.1] feature_grup_analizi.png (pasta + bar)")
 print(f"     [v5.1] ensemble_shap.png (gerçek karar mantığı)")
 print("\n" + "=" * 72)
-print(f"  BioSense AI v6.3 — TAMAMLANDI ({DATA_SUFFIX.upper()}, MOD: {CALISMA_MODU.upper()})")
+print(f"  BioSense AI v6.5 — TAMAMLANDI ({DATA_SUFFIX.upper()}, MOD: {CALISMA_MODU.upper()})")
 print("=" * 72)
