@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  BioSense AI v7.7 — TEKNOFEST Forensik: Kategorik Force + Stratified Bootstrap            ║
+║  BioSense AI v7.8 — İmbalanced FAZ2 (MCC+AUC) + Akıllı Metodoloji Tercihi            ║
 ║  Sağlıkta Yapay Zeka Yarışması — Üniversite Kategorisi                      ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║                                                                              ║
@@ -917,7 +917,7 @@ PREPROCESSING_GEREK = {
 }
 
 print("=" * 72)
-print("  BioSense AI v7.7 — TEKNOFEST Forensik: Kategorik Force + Stratified Bootstrap + Per-Trial Progress + Cache Hız")
+print("  BioSense AI v7.8 — İmbalanced FAZ2 (MCC+AUC) + Akıllı Metodoloji Tercihi + Per-Trial Progress + Cache Hız")
 print(f"  Toplam algoritma havuzu: {len(TUM_ALGORITMALAR)}")
 print(f"  FAZ 1: {sum(FAZ1_TRIAL_PER_ALGO.get(a, 30) for a in TUM_ALGORITMALAR)} "
       f"trial × {FAZ1_FOLDS*FAZ1_TEKRAR} fold")
@@ -1075,14 +1075,17 @@ BUDANAN_OZELLIKLER = []
 def get_algo(t):
     return t.user_attrs.get("algo", t.params.get("algorithm", "xgboost"))
 
-def en_iyi_f2_esik_benzersiz(y_gercek, problar, f2_tolerans=0.005):
-    """[v5.2 BUG FIX] F2 maksimum içinde MCC tie-break ile klinik denge.
+def en_iyi_f2_esik_benzersiz(y_gercek, problar, f2_tolerans=0.005,
+                              mcc_oncelikli=False):
+    """[v5.2/v7.8] F2 maksimum içinde MCC tie-break ile klinik denge.
 
     Önceki: F2 maksimumda ilk eşiği seçiyordu → aşırı recall, düşük MCC.
     Yeni: F2 ≥ (max_F2 - f2_tolerans) olan eşikler arasından MCC en yüksek.
 
-    Sebep: F2 değerleri sık sık birbirine yakın (örn. 0.20→0.9331, 0.30→0.9319).
-    Aralarında çok küçük F2 farkı (<0.005) için klinik dengeyi feda etmek mantıksız.
+    [v7.8 mcc_oncelikli] İmbalanced data (PAH %83 poz) için F2 platosu çok geniş
+    (0.10-0.50 hep aynı F2, hepsi TN=0). Bu durumda F2 körlüğünü aşmak için
+    MCC'yi BİRİNCİL kriter yap: F2 tolerans gevşek (0.02), MCC maksimize.
+    Sonuç: model gerçekten ayrım yapan eşiği bulur (TN>0).
     """
     from sklearn.metrics import matthews_corrcoef
     adaylar = np.unique(problar)
@@ -1091,7 +1094,6 @@ def en_iyi_f2_esik_benzersiz(y_gercek, problar, f2_tolerans=0.005):
     if len(adaylar) == 0:
         return 0.50, 0.0
 
-    # 1. Adım: Tüm eşiklerin F2'sini hesapla
     f2_dict = {}
     for e in adaylar:
         pred = (problar >= e).astype(int)
@@ -1101,11 +1103,11 @@ def en_iyi_f2_esik_benzersiz(y_gercek, problar, f2_tolerans=0.005):
 
     max_f2 = max(f2_dict.values())
 
-    # 2. Adım: F2 max-tolerans içindeki eşikleri filtrele
+    # [v7.8] İmbalanced modda F2 toleransı gevşet → MCC'nin ayrım yapmasına izin ver
+    etkin_tolerans = 0.02 if mcc_oncelikli else f2_tolerans
     aday_esikler = [e for e, f in f2_dict.items()
-                     if f >= (max_f2 - f2_tolerans)]
+                     if f >= (max_f2 - etkin_tolerans)]
 
-    # 3. Adım: Bu eşikler arasından MCC en yüksek olanı seç
     if len(aday_esikler) == 1:
         en_iyi_esik = aday_esikler[0]
     else:
@@ -3043,13 +3045,21 @@ print(f"  {len(hayatta_kalan)} hayatta kalan algoritma için OOF tahminleri "
 # Her hayatta kalan için OOF tahmini (best_params ile)
 oof_proba_per_algo = {}
 oof_f2_per_algo    = {}
+oof_mcc_per_algo   = {}    # [v7.8] imbalanced data için gerçek ayrım metriği
+oof_auc_per_algo   = {}    # [v7.8] eşikten bağımsız ayrım gücü
+oof_secim_skoru    = {}    # [v7.8] FAZ 2 seçimi için bileşik skor
+
+# [v7.8 KRİTİK] PAH gibi imbalanced (>%70 tek sınıf) verilerde F2 KÖR kalır:
+# naive "her şey pozitif" zaten F2≈0.96 verir, tüm algoritmalar ~aynı F2.
+# F2'ye göre seçim YANLIŞ algoritmaları seçer (önceki run: RF+kNN+SVM seçildi,
+# gerçekte en iyi CatBoost F2=0.9748 elendi). Çözüm: imbalanced'da MCC+AUC seçimi.
+_imbalanced = (max(_train_pos_orani, 1 - _train_pos_orani) > 0.70)
+if _imbalanced:
+    print(f"  [v7.8] İmbalanced veri (%{max(_train_pos_orani,1-_train_pos_orani)*100:.0f} "
+          f"tek sınıf) → FAZ 2 seçimi MCC+AUC bazlı (F2 kör kalıyor)")
 
 for algo in hayatta_kalan:
     best_params = faz1_sonuclari[algo]["best_params"]
-
-    # [FIX] Merkezi trial_to_model_params fonksiyonu kullanılıyor.
-    # v3.0'ın ilk halinde burada inline rename_dict vardı — duplikasyon
-    # ve tutarsızlık riski yarattı. Artık tek bir kaynak (TRIAL_RENAME).
     model_params = trial_to_model_params(algo, best_params, n_jobs_override=-1)
 
     print(f"  OOF [{algo:<14}] ...", end="", flush=True)
@@ -3061,12 +3071,29 @@ for algo in hayatta_kalan:
         n_jobs_override=-1,
         es_split=(FAZ2_OOF_ES_SPLIT if algo in ("xgboost", "lightgbm", "catboost") else 0.0),
     )
-    _, f2 = en_iyi_f2_esik_benzersiz(y_train, proba)
+    esik_i, f2 = en_iyi_f2_esik_benzersiz(y_train, proba)
+    pred_i = (proba >= esik_i).astype(int)
+    try:
+        mcc_i = matthews_corrcoef(y_train, pred_i)
+    except Exception:
+        mcc_i = 0.0
+    try:
+        auc_i = roc_auc_score(y_train, proba)
+    except Exception:
+        auc_i = 0.5
 
     oof_proba_per_algo[algo] = proba
     oof_f2_per_algo[algo]    = f2
+    oof_mcc_per_algo[algo]   = mcc_i
+    oof_auc_per_algo[algo]   = auc_i
 
-    print(f" OOF_F2={f2:.4f}  {time.perf_counter()-t0:.1f}s")
+    # [v7.8] Seçim skoru: imbalanced'da MCC+AUC dominant, dengeli'de F2
+    if _imbalanced:
+        oof_secim_skoru[algo] = 0.5 * ((mcc_i + 1) / 2) + 0.5 * auc_i
+    else:
+        oof_secim_skoru[algo] = f2
+
+    print(f" F2={f2:.4f} MCC={mcc_i:.3f} AUC={auc_i:.3f}  {time.perf_counter()-t0:.1f}s")
     gc.collect()
 
 # ── Korelasyon Matrisi ────────────────────────────────────────────
@@ -3103,41 +3130,43 @@ FAZ2_F2_ALT_SINIR_TOLERANS = 0.005    # [v7.6] 0.025 → 0.005 (sıkı)
 FAZ2_KORELASYON_AGIRLIGI   = 0.05     # [v7.6] 0.15 → 0.05 (F2 dominant)
 FAZ2_TOP_K_HAVUZ           = 5        # [v7.6] sadece en iyi 5'ten seç
 
-print("\n  Greedy Çeşitlilik Seçimi (v7.6: SIKI F2 alt sınır + minimal ceza):")
+# [v7.8] Seçim metriği: imbalanced'da MCC+AUC bileşik, dengeli'de F2
+_skor_adi = "MCC+AUC" if _imbalanced else "F2"
+print(f"\n  Greedy Çeşitlilik Seçimi (v7.8: {_skor_adi} bazlı + minimal korelasyon cezası):")
 
 secilen_algoritmalar = []
-en_iyi_f2_algo = max(oof_f2_per_algo, key=oof_f2_per_algo.get)
-en_iyi_f2_genel = oof_f2_per_algo[en_iyi_f2_algo]
-F2_ALT_SINIR = en_iyi_f2_genel - FAZ2_F2_ALT_SINIR_TOLERANS
+en_iyi_algo = max(oof_secim_skoru, key=oof_secim_skoru.get)
+en_iyi_skor = oof_secim_skoru[en_iyi_algo]
+SKOR_ALT_SINIR = en_iyi_skor - FAZ2_F2_ALT_SINIR_TOLERANS
 
-print(f"    En iyi OOF F2: {en_iyi_f2_genel:.4f} ({en_iyi_f2_algo})")
-print(f"    F2 alt sınır:  {F2_ALT_SINIR:.4f} (tolerans={FAZ2_F2_ALT_SINIR_TOLERANS})")
+print(f"    En iyi {_skor_adi} skoru: {en_iyi_skor:.4f} ({en_iyi_algo}) "
+      f"[F2={oof_f2_per_algo[en_iyi_algo]:.4f} MCC={oof_mcc_per_algo[en_iyi_algo]:.3f} "
+      f"AUC={oof_auc_per_algo[en_iyi_algo]:.3f}]")
+print(f"    Skor alt sınırı: {SKOR_ALT_SINIR:.4f}")
 
-# [v7.6] EN İYİ K ALGORİTMA HAVUZUNDAN seç (zayıf model girmesin)
-sirali_algo = sorted(hayatta_kalan, key=lambda a: oof_f2_per_algo[a], reverse=True)
+# [v7.8] EN İYİ K ALGORİTMA HAVUZU — seçim skoruna göre
+sirali_algo = sorted(hayatta_kalan, key=lambda a: oof_secim_skoru[a], reverse=True)
 top_k_havuz = sirali_algo[:FAZ2_TOP_K_HAVUZ]
-print(f"    Top-{FAZ2_TOP_K_HAVUZ} havuz (en yüksek F2): {top_k_havuz}")
+print(f"    Top-{FAZ2_TOP_K_HAVUZ} havuz ({_skor_adi}): {top_k_havuz}")
 
-# Adaylar: top-K içinde VE F2 alt sınırını geçen
 adaylar_kalitelli = [a for a in top_k_havuz
-                      if oof_f2_per_algo[a] >= F2_ALT_SINIR]
+                      if oof_secim_skoru[a] >= SKOR_ALT_SINIR]
 elenenler = [a for a in hayatta_kalan if a not in adaylar_kalitelli]
 
-print(f"    F2 alt sınırını geçen (top-K içinde): {len(adaylar_kalitelli)} algoritma "
+print(f"    Skor alt sınırını geçen (top-K içinde): {len(adaylar_kalitelli)} algoritma "
       f"({', '.join(adaylar_kalitelli)})")
 if elenenler:
     print(f"    Elenen: {len(elenenler)} algoritma "
           f"({', '.join(elenenler)})")
 
-# [v7.6] Yeterli aday yoksa toleransı gevşet (en az 3 algoritma seç)
 if len(adaylar_kalitelli) < FAZ2_SECILEN_SAYI:
     print(f"    [UYARI] Yeterli aday yok ({len(adaylar_kalitelli)} < {FAZ2_SECILEN_SAYI}), "
           f"top-{FAZ2_SECILEN_SAYI}'e genişletiliyor")
     adaylar_kalitelli = sirali_algo[:FAZ2_SECILEN_SAYI]
 
-# Adım 1: En yüksek F2'li algoritma
-secilen_algoritmalar.append(en_iyi_f2_algo)
-print(f"    1. {en_iyi_f2_algo.upper()} (en yüksek F2: {en_iyi_f2_genel:.4f})")
+# Adım 1: En yüksek seçim skorlu algoritma
+secilen_algoritmalar.append(en_iyi_algo)
+print(f"    1. {en_iyi_algo.upper()} (en yüksek {_skor_adi}: {en_iyi_skor:.4f})")
 
 # Adım 2+: Additive bileşik ile çeşitlilik seçimi (DÜŞÜK korelasyon ağırlığı)
 while len(secilen_algoritmalar) < FAZ2_SECILEN_SAYI:
@@ -3146,20 +3175,21 @@ while len(secilen_algoritmalar) < FAZ2_SECILEN_SAYI:
         adaylar = [a for a in hayatta_kalan if a not in secilen_algoritmalar]
         if not adaylar:
             break
-        print(f"    [UYARI] F2 alt sınırı tükendi, geri kalanlardan seçiliyor")
+        print(f"    [UYARI] Skor alt sınırı tükendi, geri kalanlardan seçiliyor")
 
     ort_kor = {}
     for a in adaylar:
         kor_listesi = [abs(korelasyon_df.loc[a, s]) for s in secilen_algoritmalar]
         ort_kor[a] = float(np.mean(kor_listesi))
 
-    # bilesik = F2 - α × ort_kor (α=0.05 düşük, F2 dominant)
-    bilesik = {a: oof_f2_per_algo[a] - FAZ2_KORELASYON_AGIRLIGI * ort_kor[a]
+    # bilesik = secim_skoru - α × ort_kor (α=0.05 düşük, skor dominant)
+    bilesik = {a: oof_secim_skoru[a] - FAZ2_KORELASYON_AGIRLIGI * ort_kor[a]
                 for a in adaylar}
     en_iyi = max(bilesik, key=bilesik.get)
 
     print(f"    {len(secilen_algoritmalar)+1}. {en_iyi.upper()}  "
-          f"(F2={oof_f2_per_algo[en_iyi]:.4f}, "
+          f"({_skor_adi}={oof_secim_skoru[en_iyi]:.4f}, "
+          f"F2={oof_f2_per_algo[en_iyi]:.4f}, MCC={oof_mcc_per_algo[en_iyi]:.3f}, "
           f"ort_kor={ort_kor[en_iyi]:.3f}, "
           f"bileşik={bilesik[en_iyi]:.4f})")
     secilen_algoritmalar.append(en_iyi)
@@ -3482,20 +3512,36 @@ for i, (algo, w, f2) in enumerate(zip(secilen_trials_algo, agirliklar,
 oof_rank_proba     = rank_ensemble(model_oof_proba_listesi)
 oof_weighted_proba = sum(w * p for w, p in zip(agirliklar, model_oof_proba_listesi))
 
+# [v7.8] İmbalanced'da rank vs weighted seçimini MCC ile yap (F2 körlüğü)
+def _yontem_skoru(proba):
+    esik, f2_ = en_iyi_f2_esik_benzersiz(y_train, proba, mcc_oncelikli=_imbalanced)
+    if _imbalanced:
+        pred = (proba >= esik).astype(int)
+        try:
+            return matthews_corrcoef(y_train, pred)
+        except Exception:
+            return f2_
+    return f2_
+
+skor_rank     = _yontem_skoru(oof_rank_proba)
+skor_weighted = _yontem_skoru(oof_weighted_proba)
 _, f2_rank     = en_iyi_f2_esik_benzersiz(y_train, oof_rank_proba)
 _, f2_weighted = en_iyi_f2_esik_benzersiz(y_train, oof_weighted_proba)
 
-ensemble_oof_proba = oof_rank_proba if f2_rank >= f2_weighted else oof_weighted_proba
-SECILEN_YONTEM     = "rank_averaging" if f2_rank >= f2_weighted else "softmax_weighted"
+ensemble_oof_proba = oof_rank_proba if skor_rank >= skor_weighted else oof_weighted_proba
+SECILEN_YONTEM     = "rank_averaging" if skor_rank >= skor_weighted else "softmax_weighted"
+_metrik_adi = "MCC" if _imbalanced else "F2"
 print(f"\n  Seçilen ensemble yöntemi: {SECILEN_YONTEM}  "
-      f"(rank={f2_rank:.4f}  weighted={f2_weighted:.4f})")
+      f"({_metrik_adi}: rank={skor_rank:.4f} weighted={skor_weighted:.4f})")
 
 # ── Isotonic Kalibrasyon + Eşik ───────────────────────────────────
 print("  Isotonic Regression kalibrasyonu...")
 iso_reg = IsotonicRegression(out_of_bounds="clip")
 iso_reg.fit(ensemble_oof_proba, y_train)
 kalibre_oof_proba    = iso_reg.predict(ensemble_oof_proba)
-OPTIMAL_ESIK, oof_f2 = en_iyi_f2_esik_benzersiz(y_train, kalibre_oof_proba)
+# [v7.8] İmbalanced veride MCC-öncelikli eşik (F2 platosu körlüğünü aş)
+OPTIMAL_ESIK, oof_f2 = en_iyi_f2_esik_benzersiz(y_train, kalibre_oof_proba,
+                                                 mcc_oncelikli=_imbalanced)
 
 oof_tahminler = (kalibre_oof_proba >= OPTIMAL_ESIK).astype(int)
 oof_f1        = f1_score(y_train, oof_tahminler, pos_label=1,
@@ -4223,13 +4269,37 @@ if ci_cakisma:
 else:
     print(f"  ⚠ Güven aralıkları çakışmıyor → İstatistiksel fark var")
 
-print(f"\n  METODOLOJİ TERCİHİ: Ensemble (4-faz hiyerarşik)")
-print(f"  Gerekçe:")
-print(f"    1. Tek modele bağımlılık yok (robustness)")
-print(f"    2. 3 farklı algoritmik paradigma birleşimi (genelleme garantisi)")
-print(f"    3. Isotonic kalibrasyon (klinik açıdan anlamlı olasılıklar)")
-if ci_cakisma:
-    print(f"    4. İstatistiksel olarak en iyi solo modele EŞİT performans")
+# [v7.8] AKILLI METODOLOJİ TERCİHİ — ensemble körü körüne savunulmaz.
+# İmbalanced veride F2 körü; akıllılık skoru (F2-naive)/(1-naive) ve solo
+# karşılaştırması ile gerçek tercihi belirle. Jüri "neden daha kötü modeli
+# seçtiniz?" sorusuna düşmemek için solo belirgin üstünse onu öner.
+ensemble_f2 = ensemble_satiri["test_f2"]
+solo_f2 = en_iyi_solo.get("test_f2", 0)
+solo_belirgin_ustun = (solo_f2 - ensemble_f2 > 0.01) and (not ci_cakisma)
+ensemble_akillilik = (ensemble_f2 - NAIVE_F2_BASELINE) / max(1.0 - NAIVE_F2_BASELINE, 1e-6)
+
+if solo_belirgin_ustun:
+    # Solo model belirgin şekilde daha iyi → onu öner
+    print(f"\n  METODOLOJİ TERCİHİ: TEK MODEL ({en_iyi_solo['model']})")
+    print(f"  Gerekçe:")
+    print(f"    1. Tek model (F2={solo_f2:.4f}) ensemble'dan (F2={ensemble_f2:.4f}) "
+          f"istatistiksel olarak ANLAMLI ÜSTÜN")
+    print(f"    2. CI çakışmıyor → fark gerçek (şans değil)")
+    print(f"    3. Daha basit model = daha az overfitting riski + yorumlanabilirlik")
+    print(f"  ⚠ NOT: Ensemble da raporlandı (şeffaflık), ancak tek model tercih edildi.")
+    if ensemble_akillilik < 0.05:
+        print(f"    4. Ensemble akıllılık skoru düşük ({ensemble_akillilik:+.3f}) "
+              f"— imbalanced veride naive baseline'a yakın")
+else:
+    print(f"\n  METODOLOJİ TERCİHİ: Ensemble (4-faz hiyerarşik)")
+    print(f"  Gerekçe:")
+    print(f"    1. Tek modele bağımlılık yok (robustness)")
+    print(f"    2. 3 farklı algoritmik paradigma birleşimi (genelleme garantisi)")
+    print(f"    3. Isotonic kalibrasyon (klinik açıdan anlamlı olasılıklar)")
+    if ci_cakisma:
+        print(f"    4. İstatistiksel olarak en iyi solo modele EŞİT performans")
+    print(f"  Ensemble akıllılık skoru: {ensemble_akillilik:+.4f} "
+          f"(naive baseline F2={NAIVE_F2_BASELINE:.4f})")
 
 # [v4.5] Klinik akıllılık metrikleri vurgusu
 print(f"\n  [v4.5] KLİNİK AKILLILIK GÖSTERGELERİ:")
@@ -4260,7 +4330,7 @@ for k in ["n_jobs", "thread_count", "verbosity", "verbose",
 
 sonuc = {
     "_aciklama": {
-        "surum"          : f"BioSense AI v7.7 — TEKNOFEST Forensik: Kategorik Force + Stratified Bootstrap + Per-Trial Progress ({DATA_SUFFIX.upper()}, {CALISMA_MODU.upper()})",
+        "surum"          : f"BioSense AI v7.8 — İmbalanced FAZ2 (MCC+AUC) + Akıllı Metodoloji Tercihi + Per-Trial Progress ({DATA_SUFFIX.upper()}, {CALISMA_MODU.upper()})",
         "calisma_modu"   : CALISMA_MODU,
         "sistem_profili" : {
             "cpu_logical"     : int(_cpu_count_logical),
@@ -4470,5 +4540,5 @@ print(f"     [v5.1] trial_convergence_*.png (3 algoritma için)")
 print(f"     [v5.1] feature_grup_analizi.png (pasta + bar)")
 print(f"     [v5.1] ensemble_shap.png (gerçek karar mantığı)")
 print("\n" + "=" * 72)
-print(f"  BioSense AI v7.7 — TAMAMLANDI ({DATA_SUFFIX.upper()}, MOD: {CALISMA_MODU.upper()})")
+print(f"  BioSense AI v7.8 — TAMAMLANDI ({DATA_SUFFIX.upper()}, MOD: {CALISMA_MODU.upper()})")
 print("=" * 72)
