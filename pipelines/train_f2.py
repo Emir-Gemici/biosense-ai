@@ -1,26 +1,39 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  BioSense AI v6.0 — TEKNOFEST FINAL — Yapısal İyileştirmeler                ║
+║  BioSense AI v6.1 — TEKNOFEST FINAL + Akıllı CLI                            ║
 ║  Sağlıkta Yapay Zeka Yarışması — Üniversite Kategorisi                      ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║                                                                              ║
-║  ─── v5.2 → v6.0 KRİTİK YAPISAL DEĞİŞİKLİKLER ───                           ║
-║   ⭐ FAZ 2 GREEDY MANTIĞI DÜZELTİLDİ (en büyük etki):                       ║
-║     Önceki: bilesik = F2 × (1-kor) → çeşitliliği aşırı vurgu                ║
-║             KANSER'de kNN (F2=0.93) seçildi, CatBoost (F2=0.95) ezildi      ║
-║     Yeni: F2 alt sınır (en iyi-0.025) + bilesik = F2 - 0.15×kor (additive)  ║
-║     Beklenen: ExtraTrees + CatBoost/LightGBM + MLP (3 paradigma + güçlü)    ║
+║  ─── KULLANIM (Akıllı CLI — Pozisyondan Bağımsız) ───                       ║
+║   python biosense_v6.1_ultra.py                                              ║
+║      → Otomatik veri seti tespiti + DEFAULT mod + GPU varsa AKTİF           ║
+║   python biosense_v6.1_ultra.py kanser                                      ║
+║      → KANSER + interactive mod seçimi                                       ║
+║   python biosense_v6.1_ultra.py kanser ultra                                ║
+║      → KANSER ULTRA + cihaz otomatik                                        ║
+║   python biosense_v6.1_ultra.py kanser ultra cpu                            ║
+║      → KANSER ULTRA + CPU zorla (GPU varsa bile kullanmaz)                  ║
+║   python biosense_v6.1_ultra.py kanser ultra cuda                           ║
+║      → KANSER ULTRA + CUDA zorla (KANSER'de bile GPU kullanır)              ║
+║   python biosense_v6.1_ultra.py master fast cuda > log.txt 2>&1             ║
+║      → MASTER FAST CUDA, log dosyaya yazılır                                 ║
 ║                                                                              ║
-║   ⭐ GPU OTOMATİK AKTİVASYONU (RTX 5080 16GB):                              ║
-║     KANSER → CPU (388 örnek için overhead büyük)                            ║
-║     CFTR/PAH/MASTER → CUDA otomatik (3-5x hızlanma)                         ║
-║     Manuel: BIOSENSE_GPU=force | off                                        ║
+║  ─── ARGÜMAN SIRASI ─── (pozisyondan bağımsız, akıllı tespit)               ║
+║   veri_seti : kanser | cftr | pah | master                                  ║
+║   mod       : fast | default | ultra                                        ║
+║   cihaz     : cpu | cuda | auto                                              ║
 ║                                                                              ║
-║   ⭐ ENSEMBLE SHAP BUG FIX:                                                 ║
-║     "Üretilemedi" hatası — kategorik dtype + check_additivity=False         ║
-║     Şimdi tüm tree üyelerden başarılı SHAP alır                             ║
+║  ─── v6.0 → v6.1 EKLEMESİ ───                                               ║
+║   ⭐ Akıllı argv parser (pozisyon bağımsız)                                 ║
+║   ⭐ Otomatik veri seti tespiti (klasördeki ilk YARISMA_TRAIN_*.csv)         ║
+║   ⭐ Manuel cihaz seçimi (cpu/cuda/auto)                                    ║
+║   ⭐ Hiç argüman yoksa tam otomatik mod                                     ║
 ║                                                                              ║
-║  v5.1/v5.2'den korunan: Eşik MCC tie-break, Softmax 25, klinik akıllılık    ║
+║  ─── v5.2 → v6.0 KORUNAN ─── (TEKNOFEST için kritik):                       ║
+║   ⭐ FAZ 2 mantığı düzeltildi: F2 alt sınır + additive bileşik              ║
+║   ⭐ GPU otomatik (KANSER CPU, MASTER CUDA)                                 ║
+║   ⭐ Ensemble SHAP bug fix                                                  ║
+║   ⭐ Eşik MCC tie-break, Softmax sıcaklık 25                                ║
 ║                                                                              ║
 ║   ✓ Trial Convergence: Her FAZ 3 algoritması için Optuna progress eğrisi    ║
 ║     → "Sistematik araştırma" kanıtı                                          ║
@@ -140,21 +153,124 @@ warnings.filterwarnings("ignore")
 #  KONTROL PANELİ
 # ══════════════════════════════════════════════════════════════════
 import sys
-# [v4.9] Komut satırı: python script.py <veri_seti> <mod>
-#        Örnek: python script.py kanser ultra
-#        Mod opsiyonel — verilmezse soracak veya BIOSENSE_MOD env değişkenine bakar
-DATA_SUFFIX = sys.argv[1].lower() if len(sys.argv) > 1 else "kanser"
-print(f"  >>> Çalıştırılan veri seti: {DATA_SUFFIX.upper()}")
+# ════════════════════════════════════════════════════════════════════
+# [v6.1] AKILLI CLI PARSER — 3 opsiyonel argüman
+# ════════════════════════════════════════════════════════════════════
+# Kullanım:
+#   python biosense_v6.1_ultra.py                       → tam otomatik
+#       (klasördeki ilk YARISMA_TRAIN_*.csv, DEFAULT mod, CUDA varsa)
+#   python biosense_v6.1_ultra.py kanser                → KANSER + sorar mod
+#   python biosense_v6.1_ultra.py kanser ultra          → KANSER ULTRA + CUDA otomatik
+#   python biosense_v6.1_ultra.py kanser ultra cpu      → KANSER ULTRA CPU
+#   python biosense_v6.1_ultra.py kanser ultra cuda     → KANSER ULTRA CUDA (zorla)
+# ════════════════════════════════════════════════════════════════════
 
-# Veri dosyası isim haritası (yarışma standardı)
+# --help argümanı
+if any(arg in ("--help", "-h", "help") for arg in sys.argv[1:]):
+    print("""
+BioSense AI v6.1 — TEKNOFEST Variant Patojenite Tahmini
+
+KULLANIM:
+  python biosense_v6.1_ultra.py [veri_seti] [mod] [cihaz]
+
+ARGÜMANLAR (pozisyondan bağımsız, hepsi opsiyonel):
+  veri_seti : kanser | cftr | pah | master
+              (yazılmazsa: klasördeki ilk YARISMA_TRAIN_*.csv otomatik)
+  mod       : fast | default | ultra
+              (yazılmazsa: DEFAULT — eğer veri seti de yoksa tam otomatik)
+  cihaz     : cpu | cuda | auto
+              (yazılmazsa: KANSER için CPU, diğerleri için CUDA varsa AKTİF)
+
+ÖRNEKLER:
+  python biosense_v6.1_ultra.py
+      → Klasördeki ilk veri seti, DEFAULT mod, GPU varsa CUDA
+
+  python biosense_v6.1_ultra.py kanser ultra
+      → KANSER ULTRA mod, KANSER için CPU otomatik
+
+  python biosense_v6.1_ultra.py master fast cuda
+      → MASTER FAST mod, CUDA zorla
+
+  python biosense_v6.1_ultra.py kanser ultra cpu > log.txt 2>&1
+      → KANSER ULTRA CPU, çıktı log dosyasına
+
+ENV DEĞIŞKENLERİ:
+  BIOSENSE_MOD=ultra    → mod ön ayarı
+  BIOSENSE_CIHAZ=cpu    → cihaz ön ayarı
+
+DAHA FAZLA:
+  https://github.com/teknofest (proje deposu)
+""")
+    sys.exit(0)
+
+# Geçerli değerler
+_GECERLI_VERI_SETI = ("kanser", "cftr", "pah", "master")
+_GECERLI_MOD       = ("fast", "default", "ultra")
+_GECERLI_CIHAZ     = ("cpu", "cuda", "auto")
+
 _DATA_FILE_MAP = {
     "kanser": "YARISMA_TRAIN_KANSER.csv",
     "cftr":   "YARISMA_TRAIN_CFTR.csv",
     "pah":    "YARISMA_TRAIN_PAH.csv",
     "master": "YARISMA_TRAIN_MASTER.csv",
 }
-VERI_DOSYASI   = _DATA_FILE_MAP.get(DATA_SUFFIX,
-                                     f"YARISMA_TRAIN_{DATA_SUFFIX.upper()}.csv")
+
+def _otomatik_veri_seti_tespit():
+    """Klasörde ilk bulunan YARISMA_TRAIN_*.csv'yi tespit et."""
+    import glob
+    aday_csvler = sorted(glob.glob("YARISMA_TRAIN_*.csv"))
+    if not aday_csvler:
+        return None
+    # İsmi normalize et: YARISMA_TRAIN_KANSER.csv → "kanser"
+    first = os.path.basename(aday_csvler[0])
+    if first.startswith("YARISMA_TRAIN_") and first.endswith(".csv"):
+        return first[len("YARISMA_TRAIN_"):-len(".csv")].lower()
+    return None
+
+# [v6.1] Tüm argv argümanlarını tara ve kategorize et (pozisyondan tam bağımsız)
+_arg_veri_seti  = None
+_arg_mod        = None
+_KULLANICI_CIHAZ = None
+_bilinmeyenler  = []
+
+for arg in sys.argv[1:]:
+    a = arg.lower().strip()
+    if a in _GECERLI_VERI_SETI:
+        _arg_veri_seti = a
+    elif a in _GECERLI_MOD:
+        _arg_mod = a
+    elif a in _GECERLI_CIHAZ:
+        _KULLANICI_CIHAZ = a
+    elif a:
+        # Bilinmeyen ama boş değil — veri seti olarak deneyelim (özel veri seti olabilir)
+        _bilinmeyenler.append(a)
+
+# ─── 1) Veri seti ─────────────────────────────────────────────────
+if _arg_veri_seti:
+    DATA_SUFFIX = _arg_veri_seti
+    _veri_kaynagi = "komut satırından"
+elif _bilinmeyenler:
+    DATA_SUFFIX = _bilinmeyenler[0]
+    _veri_kaynagi = "komut satırından (özel)"
+else:
+    DATA_SUFFIX = _otomatik_veri_seti_tespit() or "kanser"
+    _veri_kaynagi = "otomatik tespit (klasördeki ilk YARISMA_TRAIN_*.csv)"
+
+VERI_DOSYASI = _DATA_FILE_MAP.get(DATA_SUFFIX,
+                                    f"YARISMA_TRAIN_{DATA_SUFFIX.upper()}.csv")
+
+# Env fallback cihaz tercihi
+if _KULLANICI_CIHAZ is None:
+    env_cihaz = os.environ.get("BIOSENSE_CIHAZ", "").lower()
+    if env_cihaz in _GECERLI_CIHAZ:
+        _KULLANICI_CIHAZ = env_cihaz
+
+print(f"\n  >>> Veri seti  : {DATA_SUFFIX.upper()}  ({_veri_kaynagi})")
+print(f"  >>> CSV dosya  : {VERI_DOSYASI}")
+if _KULLANICI_CIHAZ:
+    print(f"  >>> Cihaz      : {_KULLANICI_CIHAZ.upper()} (kullanıcı seçimi)")
+else:
+    print(f"  >>> Cihaz      : OTOMATİK (KANSER→CPU, diğerleri→CUDA varsa)")
 
 # Tüm çıktı dosya isimleri suffix'li — 4 veri seti çakışmasın diye
 CIKTI_JSON     = f"en_iyi_parametreler_{DATA_SUFFIX}_v4.json"
@@ -262,26 +378,36 @@ try:
 except Exception:
     print(f"  GPU       : Tespit edilemedi (CPU modu)")
 
-# [v6.0] GPU kullanım politikası — veri seti boyutuna göre otomatik
-# KANSER (388) için GPU overhead büyük, CPU daha hızlı.
-# CFTR/PAH/MASTER için GPU 3-10x hız.
-# Kullanıcı manuel zorlayabilir: BIOSENSE_GPU=force veya BIOSENSE_GPU=off
-_gpu_env = os.environ.get("BIOSENSE_GPU", "").lower()
-if _gpu_env == "force":
-    GPU_AKTIF = GPU_VAR
-elif _gpu_env == "off":
+# [v6.1] GPU kullanım politikası — kullanıcı seçimi ÖNCELİKLİ
+# Öncelik sırası:
+#   1. CLI: python ... cpu | cuda | auto
+#   2. Env: BIOSENSE_CIHAZ=cpu | cuda | auto
+#   3. Otomatik: KANSER → CPU (overhead), CFTR/PAH/MASTER → CUDA (varsa)
+if _KULLANICI_CIHAZ == "cpu":
     GPU_AKTIF = False
+    print(f"  GPU kullanım: KAPALI (kullanıcı: CPU zorla)")
+elif _KULLANICI_CIHAZ == "cuda":
+    if not GPU_VAR:
+        print(f"  [UYARI] CUDA istendi ama GPU yok, CPU'ya düşülüyor")
+        GPU_AKTIF = False
+    else:
+        GPU_AKTIF = True
+        print(f"  GPU kullanım: AKTIF (kullanıcı: CUDA zorla)")
 else:
-    # Otomatik: KANSER CPU, diğerleri GPU varsa kullan
+    # Otomatik (argümanda cihaz yok veya "auto")
     GPU_AKTIF = GPU_VAR and DATA_SUFFIX in ("cftr", "pah", "master")
+    if GPU_AKTIF:
+        print(f"  GPU kullanım: AKTIF (otomatik — {DATA_SUFFIX.upper()} büyük veri)")
+    else:
+        if GPU_VAR:
+            print(f"  GPU kullanım: KAPALI (otomatik — {DATA_SUFFIX.upper()} için CPU verimli)")
+            print(f"              → CFTR/PAH/MASTER'da GPU otomatik aktif olur")
+        else:
+            print(f"  GPU kullanım: KAPALI (GPU yok)")
 
 XGB_DEVICE  = "cuda" if GPU_AKTIF else "cpu"
 LGB_DEVICE  = "gpu"  if GPU_AKTIF else "cpu"
 CB_TASK_TYPE = "GPU" if GPU_AKTIF else "CPU"
-print(f"  GPU kullanım: {'AKTIF (XGB cuda, LGB gpu, CB GPU)' if GPU_AKTIF else 'KAPALI (CPU modu)'}")
-if GPU_VAR and not GPU_AKTIF:
-    print(f"              → KANSER için CPU daha verimli (overhead az)")
-    print(f"              → CFTR/PAH/MASTER'da GPU otomatik aktif olur")
 
 # [FIX O] Algoritmaya göre paralellik stratejisi (CPU %10 problemini çözer)
 # Sorun: 24 dış worker × 24 iç thread = 576 thread → GIL bottleneck + DB lock
@@ -352,33 +478,38 @@ FAZ3_TOP_K          = 5
 
 def _mod_sec():
     """
-    Kullanıcıdan FAST / DEFAULT / ULTRA mod seçimini al.
-    - Komut satırı argümanı: python script.py kanser fast
-    - Environment variable: set BIOSENSE_MOD=ultra
-    - İnteraktif: kullanıcıya sor
+    [v6.1] FAST / DEFAULT / ULTRA mod seçimi.
+    Öncelik sırası:
+    1. _arg_mod (CLI'da parse edilmiş — pozisyon bağımsız)
+    2. BIOSENSE_MOD env değişkeni
+    3. Tam otomatik mod (hiç CLI argümanı yok) → DEFAULT
+    4. Yarı otomatik (sadece veri seti var) → interactive sor
     """
-    # 1. Komut satırından mod argümanı (3. argüman)
-    if len(sys.argv) > 2:
-        mod_arg = sys.argv[2].lower()
-        if mod_arg in ("fast", "default", "ultra"):
-            return mod_arg
+    # 1. CLI'dan parse edilmiş mod
+    if _arg_mod:
+        return _arg_mod
 
     # 2. Environment variable
     env_mod = os.environ.get("BIOSENSE_MOD", "").lower()
     if env_mod in ("fast", "default", "ultra"):
-        print(f"  [v4.9] BIOSENSE_MOD env değişkeni bulundu: {env_mod.upper()}")
+        print(f"  [v6.1] BIOSENSE_MOD env değişkeni bulundu: {env_mod.upper()}")
         return env_mod
 
-    # 3. İnteraktif soru
+    # 3. Hiç argüman yoksa (tam otomatik mod) → DEFAULT
+    if len(sys.argv) == 1:
+        print(f"  [v6.1] Tam otomatik mod → DEFAULT seçildi")
+        return "default"
+
+    # 4. Yarı otomatik (sadece veri seti) → interactive
     print(f"\n  ┌── ÇALIŞMA MODU SEÇİMİ ────────────────────────────────────┐")
     print(f"  │                                                            │")
-    print(f"  │  [1] FAST     → Hızlı (test/geliştirme için, ~10-15 dk)    │")
+    print(f"  │  [1] FAST     → Hızlı (test/geliştirme için, ~40-60 dk)    │")
     print(f"  │                  Trial %50, fold %50, sonuç ±%5            │")
     print(f"  │                                                            │")
-    print(f"  │  [2] DEFAULT  → Standart kalite (önerilen, ~25-40 dk)      │")
+    print(f"  │  [2] DEFAULT  → Standart kalite (önerilen, ~2-4 saat)      │")
     print(f"  │                  Trial %100, fold %100, dengeli            │")
     print(f"  │                                                            │")
-    print(f"  │  [3] ULTRA    → Maksimum kalite (yarışma teslimi, ~50-90)  │")
+    print(f"  │  [3] ULTRA    → Maksimum kalite (yarışma, ~6-10 saat)      │")
     print(f"  │                  Trial %150, fold %120, +10% iter          │")
     print(f"  │                                                            │")
     print(f"  └────────────────────────────────────────────────────────────┘")
@@ -497,7 +628,7 @@ PREPROCESSING_GEREK = {
 }
 
 print("=" * 72)
-print("  BioSense AI v6.0 — TEKNOFEST FINAL (FAZ 2 fix + GPU + Ensemble SHAP)")
+print("  BioSense AI v6.1 — TEKNOFEST FINAL + Akıllı CLI (3 opsiyonel argüman)")
 print(f"  Toplam algoritma havuzu: {len(TUM_ALGORITMALAR)}")
 print(f"  FAZ 1: {sum(FAZ1_TRIAL_PER_ALGO.get(a, 30) for a in TUM_ALGORITMALAR)} "
       f"trial × {FAZ1_FOLDS*FAZ1_TEKRAR} fold")
@@ -3335,7 +3466,7 @@ for k in ["n_jobs", "thread_count", "verbosity", "verbose",
 
 sonuc = {
     "_aciklama": {
-        "surum"          : f"BioSense AI v6.0 — TEKNOFEST Final (FAZ 2 fix + GPU) ({DATA_SUFFIX.upper()}, {CALISMA_MODU.upper()})",
+        "surum"          : f"BioSense AI v6.1 — TEKNOFEST Final + Akıllı CLI ({DATA_SUFFIX.upper()}, {CALISMA_MODU.upper()})",
         "calisma_modu"   : CALISMA_MODU,
         "sistem_profili" : {
             "cpu_logical"     : int(_cpu_count_logical),
@@ -3545,5 +3676,5 @@ print(f"     [v5.1] trial_convergence_*.png (3 algoritma için)")
 print(f"     [v5.1] feature_grup_analizi.png (pasta + bar)")
 print(f"     [v5.1] ensemble_shap.png (gerçek karar mantığı)")
 print("\n" + "=" * 72)
-print(f"  BioSense AI v6.0 — TAMAMLANDI ({DATA_SUFFIX.upper()}, MOD: {CALISMA_MODU.upper()})")
+print(f"  BioSense AI v6.1 — TAMAMLANDI ({DATA_SUFFIX.upper()}, MOD: {CALISMA_MODU.upper()})")
 print("=" * 72)
