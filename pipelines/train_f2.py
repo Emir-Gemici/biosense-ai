@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  BioSense AI v6.1 — TEKNOFEST FINAL + Akıllı CLI                            ║
+║  BioSense AI v6.2 — Performans Fix (Inner-Parallel) + v6.1 CLI              ║
 ║  Sağlıkta Yapay Zeka Yarışması — Üniversite Kategorisi                      ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║                                                                              ║
@@ -23,7 +23,18 @@
 ║   mod       : fast | default | ultra                                        ║
 ║   cihaz     : cpu | cuda | auto                                              ║
 ║                                                                              ║
-║  ─── v6.0 → v6.1 EKLEMESİ ───                                               ║
+║  ─── v6.1 → v6.2 KRİTİK PERFORMANS FIX ───                                  ║
+║   ⚠ SORUN: XGBoost/LightGBM/CatBoost trial içinde n_jobs=1 sabit             ║
+║      → Optuna outer-parallel ile DB lock contention → CPU %10                ║
+║      → CatBoost dışında her algoritma yavaş (CPU underutilization)           ║
+║   ✓ ÇÖZÜM: Boosting modeller için inner-parallel mantığı                     ║
+║      - algo_paralelizm: XGB/LGB/CB için (1, -1) = sıralı + tüm CPU           ║
+║      - suggest_params hardcoded n_jobs=1 → -1 (her trial tüm CPU)            ║
+║      - model_fit_universal defaults → -1                                     ║
+║      - trial_to_model_params defaults → -1                                   ║
+║   ✓ Beklenen: CPU %95+, FAZ 3 süreleri 2-3x kısalma                          ║
+║                                                                              ║
+║  ─── v6.0 → v6.1 EKLEMESİ ───                                                ║
 ║   ⭐ Akıllı argv parser (pozisyon bağımsız)                                 ║
 ║   ⭐ Otomatik veri seti tespiti (klasördeki ilk YARISMA_TRAIN_*.csv)         ║
 ║   ⭐ Manuel cihaz seçimi (cpu/cuda/auto)                                    ║
@@ -421,10 +432,30 @@ CB_TASK_TYPE = "GPU" if GPU_AKTIF else "CPU"
 # - Diğer sklearn (LR/SVM/kNN/NB/MLP): Optuna 24, model n_jobs=1
 #   → Modeller hızlı, dış paralelizm daha verimli
 def algo_paralelizm(algo):
-    """Algoritma için (optuna_n_jobs, model_n_jobs) tuple döndürür."""
+    """[v6.2] Algoritma için (optuna_n_jobs, model_n_jobs) tuple döndürür.
+
+    Strateji:
+    - C++ paralel boosting (XGB/LGB/CB): inner-parallel
+        Tüm CPU bir trial'a kanalize → SQLite DB lock contention yok
+    - sklearn tree bagging (RF/ET): VERİ SETİ BOYUTUNA GÖRE
+        Küçük data (KANSER 388): fit hızlı → outer-parallel daha verimli
+        Büyük data (MASTER 3K+): fit yavaş → inner-parallel daha verimli
+        Sebep: küçük datada joblib spawn overhead inner'ı yutuyor → CPU %10
+    - Küçük modeller (SVM/kNN/Logistic/NB/MLP): outer-parallel
+        Tek model fit'i kısa → paralel trial mantıklı
+    """
     if algo in ("random_forest", "extra_trees"):
-        return (1, -1)              # Dış sequential, iç tam paralel
-    return (PARALEL_ISCI, 1)        # Dış paralel, iç tek thread
+        # [v6.2.1 FIX] Küçük datada inner-parallel CPU %10'da kalıyordu
+        # Veri seti boyutuna göre adaptive seçim:
+        if 'N_TRAIN' in globals() and N_TRAIN < 800:
+            return (PARALEL_ISCI, 1)   # küçük data → outer paralel
+        return (1, -1)                 # büyük data → inner paralel
+    if algo in ("xgboost", "lightgbm"):
+        return (1, -1)              # C++ paralel — inner çok daha verimli
+    if algo == "catboost":
+        return (1, -1)              # thread_count ile inner paralel
+    # Küçük/sıralı modeller: outer paralel mantıklı
+    return (PARALEL_ISCI, 1)        # SVM, kNN, NB, Logistic, MLP
 
 # ── FAZ 1: Geniş tarama ───────────────────────────────────────────
 # [v4.9] BU PARAMETRELER DİNAMİK — kullanıcı modu + sistem otomatik birleştirilir
@@ -628,7 +659,7 @@ PREPROCESSING_GEREK = {
 }
 
 print("=" * 72)
-print("  BioSense AI v6.1 — TEKNOFEST FINAL + Akıllı CLI (3 opsiyonel argüman)")
+print("  BioSense AI v6.2 — Performans Fix (CPU %95+) + Akıllı CLI")
 print(f"  Toplam algoritma havuzu: {len(TUM_ALGORITMALAR)}")
 print(f"  FAZ 1: {sum(FAZ1_TRIAL_PER_ALGO.get(a, 30) for a in TUM_ALGORITMALAR)} "
       f"trial × {FAZ1_FOLDS*FAZ1_TEKRAR} fold")
@@ -1604,11 +1635,11 @@ def model_fit_universal(algo, params, X_tr, y_tr, X_val=None, y_val=None,
         # Defensif defaults — FAZ 2'den eksik params gelirse de güvenli
         p.setdefault("enable_categorical", True)
         p.setdefault("tree_method", "hist")
-        p.setdefault("device", "cpu")
+        p.setdefault("device", XGB_DEVICE)
         p.setdefault("verbosity", 0)
         p.setdefault("random_state", RASTGELE_TOHUM)
-        p.setdefault("n_jobs", 1)
-        if n_jobs_override: p["n_jobs"] = n_jobs_override
+        p.setdefault("n_jobs", -1)  # [v6.2] default -1 (inner-parallel)
+        if n_jobs_override is not None: p["n_jobs"] = n_jobs_override
         if use_es:
             m = xgb.XGBClassifier(**p, early_stopping_rounds=EARLY_STOP_ROUNDS,
                                   eval_metric="auc")
@@ -1622,9 +1653,9 @@ def model_fit_universal(algo, params, X_tr, y_tr, X_val=None, y_val=None,
         p = dict(params)
         p.setdefault("verbosity", -1)
         p.setdefault("random_state", RASTGELE_TOHUM)
-        p.setdefault("n_jobs", 1)
+        p.setdefault("n_jobs", -1)  # [v6.2] default -1 (inner-parallel)
         p.setdefault("subsample_freq", 1)
-        if n_jobs_override: p["n_jobs"] = n_jobs_override
+        if n_jobs_override is not None: p["n_jobs"] = n_jobs_override
         cat_i = kat_idx(X_tr)
         cat_i_safe = cat_i if cat_i else "auto"
         m = lgb.LGBMClassifier(**p)
@@ -1641,11 +1672,11 @@ def model_fit_universal(algo, params, X_tr, y_tr, X_val=None, y_val=None,
         p = dict(params)
         p.setdefault("random_seed", RASTGELE_TOHUM)
         p.setdefault("verbose", False)
-        p.setdefault("thread_count", 1)
+        p.setdefault("thread_count", -1)  # [v6.2] default -1 (inner-parallel)
         # [FIX H] Yeni CatBoost: default bootstrap_type=Bayesian subsample'ı kabul
         # etmez. Bernoulli klasik subsample desteklemeli.
         p.setdefault("bootstrap_type", "Bernoulli")
-        if n_jobs_override: p["thread_count"] = n_jobs_override
+        if n_jobs_override is not None: p["thread_count"] = n_jobs_override
         cat_i = kat_idx(X_tr)
         cat_i_safe = cat_i if cat_i else None
         if use_es:
@@ -1762,7 +1793,7 @@ def suggest_params(trial, algo, geniş=True):
             "reg_lambda":        trial.suggest_float("xgb_lambda", 0.1, 30.0),
             "scale_pos_weight":  trial.suggest_float("xgb_spw", SPW*0.2, SPW*6.0),
             "enable_categorical": True, "tree_method": "hist", "device": XGB_DEVICE,
-            "verbosity": 0, "random_state": RASTGELE_TOHUM, "n_jobs": 1,
+            "verbosity": 0, "random_state": RASTGELE_TOHUM, "n_jobs": -1,
         }
 
     if algo == "lightgbm":
@@ -1778,7 +1809,7 @@ def suggest_params(trial, algo, geniş=True):
             "reg_lambda":        trial.suggest_float("lgb_lambda", 0.1, 30.0),
             "min_split_gain":    trial.suggest_float("lgb_msg", 0.0, 5.0),
             "scale_pos_weight":  trial.suggest_float("lgb_spw", SPW*0.2, SPW*6.0),
-            "verbosity": -1, "random_state": RASTGELE_TOHUM, "n_jobs": 1,
+            "verbosity": -1, "random_state": RASTGELE_TOHUM, "n_jobs": -1,
             "subsample_freq": 1,
         }
 
@@ -1792,10 +1823,12 @@ def suggest_params(trial, algo, geniş=True):
             "subsample":         trial.suggest_float("cb_sub", 0.35, 1.00),
             "colsample_bylevel": trial.suggest_float("cb_cbl", 0.40, 1.00),
             "scale_pos_weight":  trial.suggest_float("cb_spw", SPW*0.2, SPW*6.0),
-            "random_seed": RASTGELE_TOHUM, "thread_count": 1, "verbose": False,
+            "random_seed": RASTGELE_TOHUM, "thread_count": -1, "verbose": False,
         }
 
     if algo == "random_forest":
+        # [v6.2.1] n_jobs dynamic — algo_paralelizm()'den oku
+        _, rf_inner_nj = algo_paralelizm("random_forest")
         return {
             "n_estimators":     trial.suggest_int("rf_n_est", 100, 1000),
             "max_depth":        trial.suggest_int("rf_depth", 3, 25),
@@ -1804,12 +1837,12 @@ def suggest_params(trial, algo, geniş=True):
             "max_features":     trial.suggest_float("rf_mf", 0.2, 1.0),
             "class_weight":     trial.suggest_categorical("rf_cw",
                                                           ["balanced", "balanced_subsample", None]),
-            # [FIX O] n_jobs=-1: Optuna outer sequential olduğunda iç paralelizm
-            # tam CPU kullanır. algo_paralelizm() bunu yönetir.
-            "n_jobs": -1, "random_state": RASTGELE_TOHUM,
+            "n_jobs": rf_inner_nj, "random_state": RASTGELE_TOHUM,
         }
 
     if algo == "extra_trees":
+        # [v6.2.1] n_jobs dynamic — algo_paralelizm()'den oku
+        _, et_inner_nj = algo_paralelizm("extra_trees")
         return {
             "n_estimators":     trial.suggest_int("et_n_est", 100, 1000),
             "max_depth":        trial.suggest_int("et_depth", 3, 25),
@@ -1818,7 +1851,7 @@ def suggest_params(trial, algo, geniş=True):
             "max_features":     trial.suggest_float("et_mf", 0.2, 1.0),
             "class_weight":     trial.suggest_categorical("et_cw",
                                                           ["balanced", "balanced_subsample", None]),
-            "n_jobs": -1, "random_state": RASTGELE_TOHUM,
+            "n_jobs": et_inner_nj, "random_state": RASTGELE_TOHUM,
         }
 
     if algo == "logistic":
@@ -1957,20 +1990,20 @@ def trial_to_model_params(algo, trial_params, n_jobs_override=None):
     if algo == "xgboost":
         p.update({"enable_categorical": True, "tree_method": "hist", "device": XGB_DEVICE,
                   "verbosity": 0, "random_state": RASTGELE_TOHUM,
-                  "n_jobs": n_jobs_override if n_jobs_override else 1})
+                  "n_jobs": n_jobs_override if n_jobs_override is not None else -1})
     elif algo == "lightgbm":
         p.update({"verbosity": -1, "random_state": RASTGELE_TOHUM, "subsample_freq": 1,
-                  "n_jobs": n_jobs_override if n_jobs_override else 1})
+                  "n_jobs": n_jobs_override if n_jobs_override is not None else -1})
     elif algo == "catboost":
         p.update({"random_seed": RASTGELE_TOHUM, "verbose": False,
-                  "thread_count": n_jobs_override if n_jobs_override else 1,
+                  "thread_count": n_jobs_override if n_jobs_override is not None else -1,
                   "bootstrap_type": "Bernoulli"})
     elif algo == "random_forest":
         p.update({"random_state": RASTGELE_TOHUM,
-                  "n_jobs": n_jobs_override if n_jobs_override else 1})
+                  "n_jobs": n_jobs_override if n_jobs_override is not None else -1})
     elif algo == "extra_trees":
         p.update({"random_state": RASTGELE_TOHUM,
-                  "n_jobs": n_jobs_override if n_jobs_override else 1})
+                  "n_jobs": n_jobs_override if n_jobs_override is not None else -1})
     elif algo == "logistic":
         p.update({"solver": "saga", "max_iter": 3000, "random_state": RASTGELE_TOHUM})
     elif algo == "svm_rbf":
@@ -3466,7 +3499,7 @@ for k in ["n_jobs", "thread_count", "verbosity", "verbose",
 
 sonuc = {
     "_aciklama": {
-        "surum"          : f"BioSense AI v6.1 — TEKNOFEST Final + Akıllı CLI ({DATA_SUFFIX.upper()}, {CALISMA_MODU.upper()})",
+        "surum"          : f"BioSense AI v6.2 — Performans Fix (Inner-Parallel) ({DATA_SUFFIX.upper()}, {CALISMA_MODU.upper()})",
         "calisma_modu"   : CALISMA_MODU,
         "sistem_profili" : {
             "cpu_logical"     : int(_cpu_count_logical),
@@ -3676,5 +3709,5 @@ print(f"     [v5.1] trial_convergence_*.png (3 algoritma için)")
 print(f"     [v5.1] feature_grup_analizi.png (pasta + bar)")
 print(f"     [v5.1] ensemble_shap.png (gerçek karar mantığı)")
 print("\n" + "=" * 72)
-print(f"  BioSense AI v6.1 — TAMAMLANDI ({DATA_SUFFIX.upper()}, MOD: {CALISMA_MODU.upper()})")
+print(f"  BioSense AI v6.2 — TAMAMLANDI ({DATA_SUFFIX.upper()}, MOD: {CALISMA_MODU.upper()})")
 print("=" * 72)
